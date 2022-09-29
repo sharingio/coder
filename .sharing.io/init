@@ -5,6 +5,8 @@ set -x
 go version | grep 1.19.1 || curl -L https://dl.google.com/go/go1.19.1.linux-amd64.tar.gz | sudo tar --directory /usr/local --extract --ungzip
 # shfmt needed for make
 which shfmt || sudo apt-get install shfmt
+# for converting k8s yaml to HCL
+go install github.com/jrhouston/tfk8s@latest
 # TODO: Make still failing, possible dependencies still missing.
 
 # install coder binary until we can build from src
@@ -48,5 +50,6 @@ CODER_URL=https://coder.${SHARINGIO_PAIR_BASE_DNS_NAME}
 # export vars to we can emulate a tty with a short expect script
 export CODER_EMAIL CODER_PASSWORD CODER_USERNAME
 coder login $CODER_URL -u $CODER_USERNAME -p $CODER_PASSWORD -e $CODER_EMAIL
-
-# TODO : upload / update the kubernetes template
+export HELM_VALUES="service:\n  type: NodePort\nsyncer:\n  extraArgs:\n    - --tls-san=${SHARINGIO_PAIR_BASE_DNS_NAME}"
+clusterctl init --infrastructure vcluster
+#TODO : upload / update the kubernetes template
