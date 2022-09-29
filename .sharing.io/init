@@ -30,13 +30,13 @@ helm install postgres bitnami/postgresql \
 	--set auth.database=coder \
 	--set persistence.size=10Gi
 # deploy via helm for now
-envsubst <.sharingio/values.template.yaml >.sharingio/values.yaml
+envsubst <.sharing.io/values.template.yaml >.sharing.io/values.yaml
 helm install coder ./helm/ \
 	--namespace coder \
-	--values .sharingio/values.yaml
+	--values .sharing.io/values.yaml
 # setup ingress
-envsubst <.sharingio/ingress.template.yaml >.sharingio/ingress.yaml
-kubectl apply -f .sharingio/ingress.yaml
+envsubst <.sharing.io/ingress.template.yaml >.sharing.io/ingress.yaml
+kubectl apply -f .sharing.io/ingress.yaml
 # Wait for coder to deploy
 kubectl rollout status deployment coder -n coder
 kubectl wait -n coder --for=condition=ready pod -l app.kubernetes.io/name=coder
