@@ -1,0 +1,2 @@
+use_kubeconfig: false
+home_disk_size: 10

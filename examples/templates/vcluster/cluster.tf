@@ -11,6 +11,13 @@ terraform {
   }
 }
 
+# https://www.terraform.io/language/providers/configuration#provider-configuration-1
+# > You can use expressions in the values of these configuration arguments,
+# but can only reference values that are known before the configuration is applied.
+# This means you can safely reference input variables, but not attributes
+# exported by resources (with an exception for resource arguments that
+# are specified directly in the configuration).
+#### no data.X :(
 # provider "kubernetes" {
 #   alias                  = "vcluster"
 #   host                   = yamldecode(data.kubernetes_resource.kubeconfig.data)["value"]["clusters"][0]["cluster"]["server"]
@@ -21,7 +28,7 @@ terraform {
 
 variable "base_domain" {
   type    = string
-  default = "test.pair.sharing.io"
+  default = "sanskar.pair.sharing.io"
 }
 
 data "coder_workspace" "me" {}
@@ -71,6 +78,10 @@ resource "kubernetes_namespace" "workspace" {
 }
 
 resource "kubernetes_manifest" "cluster" {
+  # This local-exec ensures cluster is available before the resource is considered ready
+  provisioner "local-exec" {
+    command = "kubectl wait --for=condition=Ready --timeout=999s -n ${data.coder_workspace.me.name} cluster ${data.coder_workspace.me.name}"
+  }
   manifest = {
     "apiVersion" = "cluster.x-k8s.io/v1beta1"
     "kind"       = "Cluster"
@@ -95,21 +106,6 @@ resource "kubernetes_manifest" "cluster" {
     }
   }
 }
-
-# data "kubernetes_resource" "cluster-kubeconfig" {
-#   api_version = "v1"
-#   kind        = "Secret"
-#   metadata {
-#     name      = "${data.coder_workspace.me.name}-kubeconfig"
-#     namespace = data.coder_workspace.me.name
-#   }
-
-#   depends_on = [
-#     kubernetes_namespace.workspace,
-#     kubernetes_manifest.cluster,
-#     kubernetes_manifest.vcluster
-#   ]
-# }
 
 resource "kubernetes_manifest" "vcluster" {
   manifest = {
@@ -144,69 +140,25 @@ resource "kubernetes_manifest" "vcluster" {
   }
 }
 
-resource "kubernetes_manifest" "configmap_vclusters_vcluster_init" {
+resource "kubernetes_manifest" "configmap_capi_init" {
   manifest = {
-    "apiVersion" = "v1"
-    "data" = {
-      "cool.yaml" = <<-EOT
-      apiVersion: v1
-      kind: ServiceAccount
-      metadata:
-        name: coder
-        namespace: default
-      ---
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata:
-        name: coder
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: ClusterRole
-        name: cluster-admin
-      subjects:
-        - kind: ServiceAccount
-          name: coder
-          namespace: default
-      ---
-      apiVersion: apps/v1
-      kind: StatefulSet
-      metadata:
-        name: code-server
-        namespace: default
-      spec:
-        selector:
-          matchLabels:
-            app: code-server
-        serviceName: code-server
-        template:
-          metadata:
-            labels:
-              app: code-server
-          spec:
-            serviceAccountName: coder
-            securityContext:
-              runAsUser: 1000
-              fsGroup: 1000
-            containers:
-              - name: code-server
-                image: codercom/enterprise-base:ubuntu
-                command: ${jsonencode(["sh", "-c", coder_agent.main.init_script])}
-                securityContext:
-                  runAsUser: 1000
-                env:
-                  - name: CODER_AGENT_TOKEN
-                    value: ${coder_agent.main.token}
-      EOT
-    }
     "kind" = "ConfigMap"
     "metadata" = {
-      "name"      = "vcluster-instance-init"
+      "name"      = "capi-init"
       "namespace" = data.coder_workspace.me.name
+    }
+    "apiVersion" = "v1"
+    "data" = {
+      "cool.yaml" = templatefile("cool.template.yaml",
+        {
+          coder_command = jsonencode(["sh", "-c", coder_agent.main.init_script]),
+          coder_token   = coder_agent.main.token
+      })
     }
   }
 }
 
-resource "kubernetes_manifest" "clusterresourceset_vclusters_vcluster_init" {
+resource "kubernetes_manifest" "clusterresourceset_capi_init" {
   manifest = {
     "apiVersion" = "addons.cluster.x-k8s.io/v1beta1"
     "kind"       = "ClusterResourceSet"
@@ -223,15 +175,75 @@ resource "kubernetes_manifest" "clusterresourceset_vclusters_vcluster_init" {
       "resources" = [
         {
           "kind" = "ConfigMap"
-          "name" = "vcluster-instance-init"
+          "name" = "capi-init"
         },
       ]
       "strategy" = "ApplyOnce"
     }
   }
 }
+# data "kubernetes_resource" "cluster-kubeconfig" {
+#   api_version = "v1"
+#   kind        = "Secret"
+#   metadata {
+#     name      = "${data.coder_workspace.me.name}-kubeconfig"
+#     namespace = data.coder_workspace.me.name
+#   }
+
+#   depends_on = [
+#     kubernetes_namespace.workspace,
+#     kubernetes_manifest.cluster,
+#     kubernetes_manifest.vcluster
+#   ]
+# }
+
 
 # This is generated from the vcluster...
 # Need to find a way for it to wait before running, so that the secret exists
 
 # We'll need to use the kubeconfig from above to provision the coder/pair environment
+resource "kubernetes_manifest" "ingress_capi_kubeapi" {
+  manifest = {
+    "apiVersion" = "networking.k8s.io/v1"
+    "kind"       = "Ingress"
+    "metadata" = {
+      "annotations" = {
+        "nginx.ingress.kubernetes.io/backend-protocol" = "HTTPS"
+        "nginx.ingress.kubernetes.io/ssl-redirect"     = "true"
+      }
+      "name"      = "kubeapi"
+      "namespace" = data.coder_workspace.me.name
+    }
+    "spec" = {
+      "ingressClassName" = "contour-external"
+      "rules" = [
+        {
+          "host" = "${data.coder_workspace.me.name}.${var.base_domain}"
+          "http" = {
+            "paths" = [
+              {
+                "backend" = {
+                  "service" = {
+                    "name" = "vcluster1"
+                    "port" = {
+                      "number" = 443
+                    }
+                  }
+                }
+                "path"     = "/"
+                "pathType" = "ImplementationSpecific"
+              },
+            ]
+          }
+        },
+      ]
+      "tls" = [
+        {
+          "hosts" = [
+            "${data.coder_workspace.me.name}.${var.base_domain}"
+          ]
+        },
+      ]
+    }
+  }
+}
