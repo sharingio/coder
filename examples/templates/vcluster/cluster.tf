@@ -46,6 +46,10 @@ resource "coder_agent" "main" {
     if [ ! -f ~/.bashrc ]; then
       cp /etc/skel/.bashrc $HOME
     fi
+    echo 'export PATH="$PATH:$HOME/bin"' >> $HOME/.bashrc
+    mkdir -p bin
+    curl -o bin/kubectl -L https://dl.k8s.io/v1.25.2/bin/linux/amd64/kubectl
+    chmod +x bin/*
 
     # install and start code-server
     curl -fsSL https://code-server.dev/install.sh | sh  | tee code-server-install.log
@@ -62,7 +66,7 @@ resource "coder_app" "code-server" {
   relative_path = true
 
   healthcheck {
-    url       = "http://localhost:1337/healthz"
+    url       = "http://localhost:13337/healthz"
     interval  = 3
     threshold = 10
   }
@@ -78,10 +82,6 @@ resource "kubernetes_namespace" "workspace" {
 }
 
 resource "kubernetes_manifest" "cluster" {
-  # This local-exec ensures cluster is available before the resource is considered ready
-  provisioner "local-exec" {
-    command = "kubectl wait --for=condition=Ready --timeout=999s -n ${data.coder_workspace.me.name} cluster ${data.coder_workspace.me.name}"
-  }
   manifest = {
     "apiVersion" = "cluster.x-k8s.io/v1beta1"
     "kind"       = "Cluster"
@@ -153,8 +153,55 @@ resource "kubernetes_manifest" "configmap_capi_init" {
         {
           coder_command = jsonencode(["sh", "-c", coder_agent.main.init_script]),
           coder_token   = coder_agent.main.token
+          instance_name = data.coder_workspace.me.name
       })
     }
+  }
+}
+
+data "kubernetes_secret" "vcluster-kubeconfig" {
+  metadata {
+    name      = "${data.coder_workspace.me.name}-kubeconfig"
+    namespace = data.coder_workspace.me.name
+  }
+
+  depends_on = [
+    kubernetes_manifest.cluster,
+    kubernetes_manifest.vcluster,
+    kubernetes_manifest.clusterresourceset_capi_init
+  ]
+}
+
+// using a manifest instead of secret, so that the wait capability works
+resource "kubernetes_manifest" "configmap_capi_kubeconfig" {
+  manifest = {
+    "kind" = "Secret"
+    "metadata" = {
+      "name"      = "vcluster-kubeconfig"
+      "namespace" = data.coder_workspace.me.name
+    }
+    "apiVersion" = "v1"
+    "type"       = "addons.cluster.x-k8s.io/resource-set"
+    "data" = {
+      "kubeconfig.yaml" = base64encode(data.kubernetes_secret.vcluster-kubeconfig.data.value)
+    }
+  }
+
+  depends_on = [
+    kubernetes_manifest.cluster,
+    kubernetes_manifest.vcluster,
+    kubernetes_manifest.clusterresourceset_capi_init,
+    data.kubernetes_secret.vcluster-kubeconfig
+  ]
+
+  wait {
+    fields = {
+      "data[\"kubeconfig.yaml\"]" = "*"
+    }
+  }
+
+  timeouts {
+    create = "1m"
   }
 }
 
@@ -177,6 +224,10 @@ resource "kubernetes_manifest" "clusterresourceset_capi_init" {
           "kind" = "ConfigMap"
           "name" = "capi-init"
         },
+        {
+          "kind" = "Secret"
+          "name" = "vcluster-kubeconfig"
+        },
       ]
       "strategy" = "ApplyOnce"
     }
@@ -196,7 +247,6 @@ resource "kubernetes_manifest" "clusterresourceset_capi_init" {
 #     kubernetes_manifest.vcluster
 #   ]
 # }
-
 
 # This is generated from the vcluster...
 # Need to find a way for it to wait before running, so that the secret exists
@@ -245,5 +295,17 @@ resource "kubernetes_manifest" "ingress_capi_kubeapi" {
         },
       ]
     }
+  }
+}
+
+resource "coder_app" "vcluster-apiserver" {
+  agent_id      = coder_agent.main.id
+  name          = "APIServer"
+  url           = "https://kubernetes.default.svc:443"
+  relative_path = true
+  healthcheck {
+    url       = "https://kubernetes.default.svc:443/healthz"
+    interval  = 5
+    threshold = 6
   }
 }
