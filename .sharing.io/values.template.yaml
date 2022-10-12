@@ -9,10 +9,25 @@ coder:
   # `CODER_TLS_ENABLE`, `CODER_TLS_CERT_FILE` or `CODER_TLS_KEY_FILE` as
   # they are already set by the Helm chart and will cause conflicts.
   image:
-    tag: "v0.9.0"
+    tag: "v0.9.8"
+  ingress:
+    enable: true
+    className: contour-external
+    host: "coder.${SHARINGIO_PAIR_BASE_DNS_NAME}"
+    wildcardHost: "*.${SHARINGIO_PAIR_BASE_DNS_NAME}"
+    # annotations:
+    #   kubernetes.io/ingress.class: contour-external
+    tls:
+      enable: true
+      secretName: "letsencrypt-prod"
+      wildcardSecretName: "letsencrypt-prod"
   env:
-    - name: CODER_ACCESS_URL
-      value: "https://coder.${SHARINGIO_PAIR_BASE_DNS_NAME}"
+    # TODO: bring back when ingress websocks work again
+    # Having a empty ACCESS_URL means --tunnel in enabled
+    # - name: CODER_ACCESS_URL
+    #  value: "https://coder.${SHARINGIO_PAIR_BASE_DNS_NAME}"
+    - name: CODER_WILDCARD_ACCESS_URL
+      value: "*.${SHARINGIO_PAIR_BASE_DNS_NAME}"
     - name: CODER_PG_CONNECTION_URL
       value: "postgres://coder:coder@postgres-postgresql.coder.svc.cluster.local:5432/coder?sslmode=disable"
     # This env variable controls whether or not to auto-import the "kubernetes"
