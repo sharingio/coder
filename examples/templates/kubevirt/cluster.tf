@@ -575,6 +575,9 @@ resource "coder_app" "emacs-broadway" {
   # }
 }
 
+resource "time_sleep" "wait_50_seconds" {
+  create_duration = "50s"
+}
 data "kubernetes_secret_v1" "kubeconfig" {
   metadata {
     name      = "${data.coder_workspace.me.name}-kubeconfig"
@@ -585,7 +588,8 @@ data "kubernetes_secret_v1" "kubeconfig" {
     kubernetes_manifest.clusterresourceset_capi_init,
     kubernetes_manifest.kubeadmcontrolplane_control_plane,
     kubernetes_manifest.kvcluster,
-    kubernetes_manifest.cluster
+    kubernetes_manifest.cluster,
+    time_sleep.wait_50_seconds
   ]
 }
 
@@ -597,10 +601,11 @@ resource "coder_metadata" "kubeconfig" {
   }
   item {
     key   = "kubeconfig"
-    value = data.kubernetes_secret_v1.kubeconfig.data.value
+    value = data.kubernetes_secret_v1.kubeconfig == null ? "" : data.kubernetes_secret_v1.kubeconfig.data.value
   }
 
   depends_on = [
-    data.kubernetes_secret_v1.kubeconfig
+    data.kubernetes_secret_v1.kubeconfig,
+    time_sleep.wait_50_seconds
   ]
 }
