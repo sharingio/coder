@@ -47,18 +47,17 @@ resource "coder_agent" "main" {
       cp /etc/skel/.bashrc $HOME
     fi
     echo 'export PATH="$PATH:$HOME/bin"' >> $HOME/.bashrc
-    mkdir -p bin
-    curl -o bin/kubectl -L https://dl.k8s.io/v1.25.2/bin/linux/amd64/kubectl
-    curl -o bin/ttyd -L https://github.com/tsl0922/ttyd/releases/download/1.7.2/ttyd.x86_64
-    chmod +x bin/*
-    # install tmux
-    sudo apt update -y
-    sudo apt install -y tmux
 
+    sudo apt-get install -y tmux ttyd libwebsockets-evlib-uv
+    # start broadwayd and emacs
+    broadwayd :5 2>&1 | tee broadwayd.log &
+    GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 emacs 2>&1 | tee emacs.log &
+    # start ttyd / tmux
+    tmux new -d
+    ttyd tmux at 2>&1 | tee ttyd.log &
     # install and start code-server
     curl -fsSL https://code-server.dev/install.sh | sh  | tee code-server-install.log
     code-server --auth none --port 13337 | tee code-server-install.log &
-    /home/coder/bin/ttyd tmux | tee ttyd.log &
   EOT
 }
 
@@ -546,14 +545,38 @@ resource "coder_app" "tmux" {
   }
 }
 
-resource "coder_app" "vcluster-apiserver" {
-  agent_id      = coder_agent.main.id
-  name          = "APIServer"
-  url           = "https://kubernetes.default.svc:443"
-  relative_path = true
-  healthcheck {
-    url       = "https://kubernetes.default.svc:443/healthz"
-    interval  = 5
-    threshold = 6
-  }
+# ttyd
+resource "coder_app" "ttyd" {
+  subdomain    = false
+  share        = "public"
+  slug         = "ttyd"
+  display_name = "ttyd for tmux"
+  icon         = "/icon/folder.svg" # let's maybe get an emacs.svg somehow
+  agent_id     = coder_agent.main.id
+  url          = "http://localhost:7681" # 7681 is the default ttyd port
+
+  # healthcheck {
+  #   # don't want to disconnect current session, but hopefully this will 200OK
+  #   url       = "http://localhost:7681/"
+  #   interval  = 3
+  #   threshold = 10
+  # }
+}
+
+# emacs-broadway
+resource "coder_app" "emacs-broadway" {
+  subdomain    = false
+  share        = "public"
+  agent_id     = coder_agent.main.id
+  slug         = "emacs-broadway"
+  display_name = "Emacs on Broadway"
+  icon         = "/icon/folder.svg"      # let's maybe get an emacs.svg somehow
+  url          = "http://localhost:8085" # port 8080 + BROADWAY_DISPLAY
+
+  # healthcheck {
+  #   # don't want to disconnect current session, but hopefully this will 200OK
+  #   url       = "http://localhost:8085/"
+  #   interval  = 3
+  #   threshold = 10
+  # }
 }
