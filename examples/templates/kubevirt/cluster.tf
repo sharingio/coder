@@ -235,7 +235,6 @@ resource "kubernetes_manifest" "kubeadmcontrolplane_control_plane" {
     "spec" = {
       "kubeadmConfigSpec" = {
         "clusterConfiguration" = {
-          "imageRepository" = "registry.k8s.io"
           "networking" = {
             "podSubnet"     = "10.244.0.0/16"
             "serviceSubnet" = "10.95.0.0/16"
