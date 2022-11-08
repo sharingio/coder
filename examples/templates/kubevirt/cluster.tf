@@ -6,7 +6,7 @@ terraform {
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = "~> 2.12.1"
+      version = "2.15.0"
     }
   }
 }
@@ -573,4 +573,34 @@ resource "coder_app" "emacs-broadway" {
   #   interval  = 3
   #   threshold = 10
   # }
+}
+
+data "kubernetes_secret_v1" "kubeconfig" {
+  metadata {
+    name      = "${data.coder_workspace.me.name}-kubeconfig"
+    namespace = data.coder_workspace.me.name
+  }
+
+  depends_on = [
+    kubernetes_manifest.clusterresourceset_capi_init,
+    kubernetes_manifest.kubeadmcontrolplane_control_plane,
+    kubernetes_manifest.kvcluster,
+    kubernetes_manifest.cluster
+  ]
+}
+
+resource "coder_metadata" "kubeconfig" {
+  resource_id = "${data.coder_workspace.me.name}-kubeconfig"
+  item {
+    key   = "description"
+    value = "The kubeconfig to connect to the cluster with"
+  }
+  item {
+    key   = "kubeconfig"
+    value = data.kubernetes_secret_v1.kubeconfig.data.value
+  }
+
+  depends_on = [
+    data.kubernetes_secret_v1.kubeconfig
+  ]
 }
