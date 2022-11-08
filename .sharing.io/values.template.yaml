@@ -29,7 +29,7 @@ coder:
     - name: CODER_TELEMETRY_TRACE
       value: "false"
     - name: CODER_WILDCARD_ACCESS_URL
-      value: "*.coder.${SHARINGIO_PAIR_BASE_DNS_NAME}"
+      value: "*.${SHARINGIO_PAIR_BASE_DNS_NAME}"
   ingress:
     enable: true
     className: $SHARINGIO_PAIR_INSTANCE_INGRESS_CLASS_NAME

@@ -32,28 +32,24 @@ ls -la /usr/local/bin/coder
 
 cd ~/sharingio/coder
 rm -rf ~/.config/coderv2/ # delete database
-# CODER_EXPERIMENTAL=true \
 # CODER_TEMPLATE_AUTOIMPORT=coder-emacs \
-CODER_ACCESS_URL=https://coder.talos.pair.sharing.io \
+# CODER_ACCESS_URL=https://coder.talos.pair.sharing.io \
+# CODER_WILDCARD_ACCESS_URL="*.coder.talos.pair.sharing.io" \
+# CODER_WILDCARD_ACCESS_URL="*.^o" \
+CODER_EXPERIMENTAL=true \
 CODER_VERBOSE=true \
 CODER_AUDIT_LOGGING=false \
 CODER_TELEMETRY=false \
 CODER_TELEMETRY_TRACE=false \
-CODER_WILDCARD_ACCESS_URL="*.coder.talos.pair.sharing.io" \
     coder server \
     2>&1 | tee coder-server.log
 #+end_src
-#+begin_src shell
-coder login `cat ~/.config/coderv2/url` -u ii -p ii -e ii@ii.nz
+#+begin_src tmate :window coder :dir "../../.."
+coder login `cat ~/.config/coderv2/url` --first-user-username ii --first-user-password ii --first-user-email ii@ii.nz
 #+end_src
 
 #+RESULTS:
 #+begin_example
-> Your Coder deployment hasn't been set up!
-
-  Welcome to Coder, ii! You're authenticated.
-
-  Get started by creating a template:  coder templates init
 #+end_example
 
 ** kubernetes workspace

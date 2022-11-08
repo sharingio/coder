@@ -38,13 +38,13 @@ kubectl wait -n coder --for=condition=ready pod -l app.kubernetes.io/name=coder
 
 # create the initial user
 # populate ii or pair as an admin user without logging in
-CODER_EMAIL=ii@ii.coop
-CODER_PASSWORD=ii
-CODER_USERNAME=ii
+CODER_FIRST_USER_EMAIL=ii@ii.nz
+CODER_FIRST_USER_PASSWORD=ii
+CODER_FIRST_USER_USERNAME=ii
 CODER_URL=https://coder.${SHARINGIO_PAIR_BASE_DNS_NAME}
 # export vars to we can emulate a tty with a short expect script
-export CODER_EMAIL CODER_PASSWORD CODER_USERNAME
-coder login $CODER_URL -u $CODER_USERNAME -p $CODER_PASSWORD -e $CODER_EMAIL
+export CODER_FIRST_USER_EMAIL CODER_FIRST_USER_PASSWORD CODER_FIRST_USER_USERNAME
+coder login $CODER_URL
 export HELM_VALUES="service:\n  type: NodePort\nsyncer:\n  extraArgs:\n    - --tls-san=${SHARINGIO_PAIR_BASE_DNS_NAME}"
 export EXP_CLUSTER_RESOURCE_SET=true
 
