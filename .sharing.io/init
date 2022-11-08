@@ -29,7 +29,7 @@ helm install postgres bitnami/postgresql \
 	--set persistence.size=10Gi
 # deploy via helm for now
 envsubst <.sharing.io/values.template.yaml >.sharing.io/values.yaml
-helm install coder ./helm/ \
+helm upgrade --install coder ./helm/ \
 	--namespace coder \
 	--values .sharing.io/values.yaml
 # # Wait for coder to deploy
@@ -74,6 +74,5 @@ clusterctl init --bootstrap talos --control-plane talos
 kubectl apply -f ./examples/templates/kubevirt-talos/role+rolebinding.yaml
 
 kubectl create ns coder-workspaces
-
 
 #TODO : upload / update the kubernetes template

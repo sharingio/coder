@@ -2,7 +2,7 @@ terraform {
   required_providers {
     coder = {
       source  = "coder/coder"
-      version = "0.4.15"
+      version = "0.6.1"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
@@ -61,19 +61,21 @@ resource "coder_agent" "main" {
   EOT
 }
 
+
 # code-server
 resource "coder_app" "code-server" {
-  agent_id      = coder_agent.main.id
-  name          = "code-server"
-  icon          = "/icon/code.svg"
-  url           = "http://localhost:13337?folder=/home/coder"
-  relative_path = true
+  agent_id     = coder_agent.main.id
+  display_name = "code-server"
+  slug         = "code-server"
+  icon         = "/icon/code.svg"
+  url          = "http://localhost:13337?folder=/home/coder"
+  subdomain    = false
 
-  healthcheck {
-    url       = "http://localhost:13337/healthz"
-    interval  = 3
-    threshold = 10
-  }
+  # healthcheck {
+  #   url       = "http://localhost:13337/healthz"
+  #   interval  = 3
+  #   threshold = 10
+  # }
 }
 
 resource "kubernetes_namespace" "workspace" {
@@ -527,22 +529,14 @@ resource "kubernetes_manifest" "clusterresourceset_capi_init" {
 #   }
 # }
 
-resource "coder_app" "tmux-cmd" {
-  agent_id = coder_agent.main.id
-  name     = "tmux"
-  command  = "tmux at"
-}
-
+# tmux
 resource "coder_app" "tmux" {
-  agent_id      = coder_agent.main.id
-  name          = "tmux"
-  url           = "http://localhost:7681"
-  relative_path = true
-  healthcheck {
-    url       = "http://localhost:7681"
-    interval  = 5
-    threshold = 6
-  }
+  agent_id     = coder_agent.main.id
+  display_name = "tmux"
+  slug         = "tmux"
+  icon         = "/icon/folder.svg" # let's maybe get an emacs.svg somehow
+  command      = "tmux at"
+  share        = "public"
 }
 
 # ttyd
