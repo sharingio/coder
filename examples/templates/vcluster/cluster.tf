@@ -2,7 +2,7 @@ terraform {
   required_providers {
     coder = {
       source  = "coder/coder"
-      version = "0.4.15"
+      version = "0.6.1"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
@@ -54,11 +54,13 @@ resource "coder_agent" "main" {
 
 # code-server
 resource "coder_app" "code-server" {
-  agent_id      = coder_agent.main.id
-  name          = "code-server"
-  icon          = "/icon/code.svg"
-  url           = "http://localhost:13337?folder=/home/coder"
-  relative_path = true
+  agent_id     = coder_agent.main.id
+  slug         = "code-server"
+  display_name = "code-server"
+  icon         = "/icon/code.svg"
+  url          = "http://localhost:13337?folder=/home/coder"
+  subdomain    = true
+  # relative_path = true
 
   healthcheck {
     url       = "http://localhost:13337/healthz"
@@ -232,6 +234,24 @@ resource "kubernetes_manifest" "clusterresourceset_capi_init" {
     }
   }
 }
+resource "time_sleep" "wait_50_seconds" {
+  create_duration = "50s"
+}
+
+data "kubernetes_secret_v1" "kubeconfig" {
+  metadata {
+    name      = "${data.coder_workspace.me.name}-kubeconfig"
+    namespace = data.coder_workspace.me.name
+  }
+
+  depends_on = [
+    # kubernetes_manifest.clusterresourceset_capi_init,
+    # kubernetes_manifest.kubeadmcontrolplane_control_plane,
+    # kubernetes_manifest.kvcluster,
+    kubernetes_manifest.cluster,
+    time_sleep.wait_50_seconds
+  ]
+}
 # data "kubernetes_resource" "cluster-kubeconfig" {
 #   api_version = "v1"
 #   kind        = "Secret"
@@ -243,9 +263,31 @@ resource "kubernetes_manifest" "clusterresourceset_capi_init" {
 #   depends_on = [
 #     kubernetes_namespace.workspace,
 #     kubernetes_manifest.cluster,
-#     kubernetes_manifest.vcluster
+#     kubernetes_manifest.vcluster,
+#     kubernetes_manifest.clusterresourceset_capi_init,
+#     kubernetes_manifest.kubeadmcontrolplane_control_plane,
+#     time_sleep.wait_50_seconds
 #   ]
 # }
+
+resource "coder_metadata" "kubeconfig" {
+  count       = data.coder_workspace.me.start_count
+  hide        = false
+  resource_id = data.kubernetes_secret_v1.kubeconfig.id
+  item {
+    key   = "description"
+    value = "The kubeconfig to connect to the cluster with"
+  }
+  item {
+    key   = "kubeconfig"
+    value = data.kubernetes_secret_v1.kubeconfig == null ? "" : data.kubernetes_secret_v1.kubeconfig.data.value
+  }
+
+  depends_on = [
+    data.kubernetes_secret_v1.kubeconfig,
+    time_sleep.wait_50_seconds
+  ]
+}
 
 # This is generated from the vcluster...
 # Need to find a way for it to wait before running, so that the secret exists
