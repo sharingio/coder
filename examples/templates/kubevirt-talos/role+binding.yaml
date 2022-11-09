@@ -42,6 +42,17 @@ rules:
       - "create"
       - "delete"
   - apiGroups:
+      - "networking.k8s.io"
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
       - ""
     resources:
       - secrets

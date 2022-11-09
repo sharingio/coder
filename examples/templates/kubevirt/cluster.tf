@@ -100,6 +100,10 @@ resource "kubernetes_manifest" "cluster" {
       }
     }
     "spec" = {
+      "controlPlaneEndpoint" = {
+        "host" = "${data.coder_workspace.me.name}-apiserver.${data.kubernetes_ingress_v1.coder.spec.0.rule.0.host}"
+        "port" = 443
+      }
       "controlPlaneRef" = {
         "apiVersion" = "controlplane.cluster.x-k8s.io/v1beta1"
         "kind"       = "KubeadmControlPlane"
@@ -141,34 +145,18 @@ resource "kubernetes_manifest" "kvcluster" {
       "namespace" = data.coder_workspace.me.name
     }
     "spec" = {
-      "controlPlaneServiceTemplate" = {
-        "spec" = {
-          "type" = "ClusterIP"
-        }
+      "controlPlaneEndpoint" = {
+        "host" = "${data.coder_workspace.me.name}-apiserver.${data.kubernetes_ingress_v1.coder.spec.0.rule.0.host}"
+        "port" = 443
       }
+      # "controlPlaneServiceTemplate" = {
+      #   "spec" = {
+      #     "type" = "ClusterIP"
+      #   }
+      # }
       # "controlPlaneEndpoint" = {
       #   "host" = ""
       #   "port" = 0
-      # }
-      # "kubernetesVersion" = "1.23.4"
-      # "helmRelease" = {
-      #   "chart" = {
-      #     "name"    = null
-      #     "repo"    = null
-      #     "version" = null
-      #   }
-      #   "values" = <<-EOT
-      #   service:
-      #     type: NodePort
-      #   securityContext:
-      #     runAsUser: 12345
-      #     runAsNonRoot: true
-      #     privileged: false
-      #   syncer:
-      #     extraArgs:
-      #       - --tls-san="${data.coder_workspace.me.name}.${var.base_domain}"
-      #       - --tls-san="${data.coder_workspace.me.name}.${data.coder_workspace.me.name}.svc"
-      #   EOT
       # }
     }
   }
@@ -252,6 +240,10 @@ resource "kubernetes_manifest" "kubeadmcontrolplane_control_plane" {
           "networking" = {
             "podSubnet"     = "10.244.0.0/16"
             "serviceSubnet" = "10.95.0.0/16"
+          }
+          "controlPlaneEndpoint" = "${data.coder_workspace.me.name}-apiserver.${data.kubernetes_ingress_v1.coder.spec.0.rule.0.host}:443"
+          "apiServer" = {
+            "certSANs" = ["${data.coder_workspace.me.name}-apiserver.${data.kubernetes_ingress_v1.coder.spec.0.rule.0.host}"]
           }
         }
         "initConfiguration" = {
@@ -645,6 +637,48 @@ resource "coder_metadata" "kubeconfig" {
 
   depends_on = [
     data.kubernetes_secret_v1.kubeconfig,
+    time_sleep.wait_50_seconds
+  ]
+}
+
+data "kubernetes_ingress_v1" "coder" {
+  metadata {
+    name      = "coder"
+    namespace = "coder"
+  }
+}
+
+resource "kubernetes_ingress_v1" "apiserver" {
+  metadata {
+    name      = "${data.coder_workspace.me.name}-apiserver"
+    namespace = data.coder_workspace.me.name
+    annotations = {
+      "nginx.ingress.kubernetes.io/backend-protocol" = "HTTPS"
+      "nginx.ingress.kubernetes.io/ssl-passthrough"  = "true"
+    }
+  }
+  spec {
+    ingress_class_name = "nginx"
+    rule {
+      host = "${data.coder_workspace.me.name}-apiserver.${data.kubernetes_ingress_v1.coder.spec.0.rule.0.host}"
+      http {
+        path {
+          path = "/"
+          backend {
+            service {
+              name = "${data.coder_workspace.me.name}-lb"
+              port {
+                number = 6443
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    kubernetes_namespace.workspace,
     time_sleep.wait_50_seconds
   ]
 }
