@@ -79,6 +79,7 @@ resource "coder_app" "code-server" {
 }
 
 resource "kubernetes_namespace" "workspace" {
+  count = data.coder_workspace.me.start_count
   metadata {
     name = data.coder_workspace.me.name
     labels = {
@@ -125,6 +126,10 @@ resource "kubernetes_manifest" "cluster" {
       }
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "kvcluster" {
@@ -167,6 +172,10 @@ resource "kubernetes_manifest" "kvcluster" {
       # }
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "kubevirtmachinetemplate_control_plane" {
@@ -223,6 +232,10 @@ resource "kubernetes_manifest" "kubevirtmachinetemplate_control_plane" {
       }
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "kubeadmcontrolplane_control_plane" {
@@ -267,6 +280,10 @@ resource "kubernetes_manifest" "kubeadmcontrolplane_control_plane" {
       "version"  = "v1.23.5"
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "kubevirtmachinetemplate_md_0" {
@@ -323,6 +340,10 @@ resource "kubernetes_manifest" "kubevirtmachinetemplate_md_0" {
       }
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "kubeadmconfigtemplate_md_0" {
@@ -346,6 +367,10 @@ resource "kubernetes_manifest" "kubeadmconfigtemplate_md_0" {
     #   }
     # }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "machinedeployment_md_0" {
@@ -384,6 +409,10 @@ resource "kubernetes_manifest" "machinedeployment_md_0" {
       }
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 resource "kubernetes_manifest" "configmap_capi_init" {
@@ -404,6 +433,10 @@ resource "kubernetes_manifest" "configmap_capi_init" {
       "flannel.yaml" = templatefile("flannel.yaml", {})
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 
 # data "kubernetes_secret" "vcluster-kubeconfig" {
@@ -479,6 +512,10 @@ resource "kubernetes_manifest" "clusterresourceset_capi_init" {
       "strategy" = "ApplyOnce"
     }
   }
+
+  depends_on = [
+    kubernetes_namespace.workspace
+  ]
 }
 # data "kubernetes_resource" "cluster-kubeconfig" {
 #   api_version = "v1"
@@ -594,14 +631,16 @@ data "kubernetes_secret_v1" "kubeconfig" {
 }
 
 resource "coder_metadata" "kubeconfig" {
-  resource_id = "${data.coder_workspace.me.name}-kubeconfig"
+  count       = data.coder_workspace.me.start_count
+  resource_id = kubernetes_namespace.workspace[0].id
   item {
     key   = "description"
     value = "The kubeconfig to connect to the cluster with"
   }
   item {
-    key   = "kubeconfig"
-    value = data.kubernetes_secret_v1.kubeconfig == null ? "" : data.kubernetes_secret_v1.kubeconfig.data.value
+    key       = "kubeconfig"
+    value     = data.kubernetes_secret_v1.kubeconfig == null ? "" : data.kubernetes_secret_v1.kubeconfig.data.value
+    sensitive = true
   }
 
   depends_on = [
