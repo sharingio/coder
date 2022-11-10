@@ -37,5 +37,5 @@ coder:
     wildcardHost: "*.${SHARINGIO_PAIR_BASE_DNS_NAME}"
     tls:
       enable: true
-      secretName: letsencrypt-prod
-      wildcardSecretName: "letsencrypt-prod"
+      secretName: letsencrypt-coder
+      wildcardSecretName: "letsencrypt-coder"

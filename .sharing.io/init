@@ -17,6 +17,10 @@ which coder || (
 
 # Deploying coder (from helm for now)
 kubectl create namespace coder
+
+envsubst <.sharing.io/certs.yaml |
+	kubectl apply -f -
+
 # ensure ingress works / certs secrets get copied
 kubectl label ns coder cert-manager-tls=sync
 # needs a postgres db

@@ -1,0 +1,39 @@
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-coder
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: $SHARINGIO_PAIR_INSTANCE_SETUP_EMAIL
+    privateKeySecretRef:
+      name: letsencrypt-coder
+    solvers:
+      - dns01:
+          rfc2136:
+            tsigKeyName: pair
+            tsigAlgorithm: HMACMD5
+            tsigSecretSecretRef:
+              name: tsig-powerdns
+              key: powerdns
+            nameserver: ${KUBERNETES_CONTROLPLANE_ENDPOINT}
+        selector:
+          dnsNames:
+            - "*.coder.${SHARINGIO_PAIR_INSTANCE_SETUP_BASEDNSNAME}"
+            - "coder.${SHARINGIO_PAIR_INSTANCE_SETUP_BASEDNSNAME}"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: letsencrypt-coder
+  namespace: coder
+spec:
+  secretName: letsencrypt-coder
+  issuerRef:
+    name: letsencrypt-coder
+    kind: ClusterIssuer
+  commonName: "*.coder.${SHARINGIO_PAIR_INSTANCE_SETUP_BASEDNSNAME}"
+  dnsNames:
+    - "*.coder.${SHARINGIO_PAIR_INSTANCE_SETUP_BASEDNSNAME}"
+    - "coder.${SHARINGIO_PAIR_INSTANCE_SETUP_BASEDNSNAME}"
