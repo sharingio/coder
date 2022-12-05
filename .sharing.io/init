@@ -85,6 +85,6 @@ kubectl create ns coder-workspaces
 echo "WARNING: you are patching the image version for the cluster-api-provider-kubevirt (capk-system/deployment/capk-controller-manager)"
 kubectl -n capk-system \
 	patch deployment capk-controller-manager \
-	--type=json -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value":"ghcr.io/ii/cluster-api-provider-kubevirt@sha256:c1030577c70b4797fa1d3a8b56aa2a7009da2960e4a7d40f0528c3a9f376f604"}]'
+	--type=json -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value":"ghcr.io/ii/cluster-api-provider-kubevirt@sha256:c1030577c70b4797fa1d3a8b56aa2a7009da2960e4a7d40f0528c3a9f376f604"}, {"op": "replace", "path": "/spec/template/spec/containers/0/imagePullPolicy", "value":"IfNotPresent"}]'
 
 #TODO : upload / update the kubernetes template
