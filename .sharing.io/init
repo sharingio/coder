@@ -79,4 +79,12 @@ kubectl apply -f ./examples/templates/kubevirt-talos/role+rolebinding.yaml
 
 kubectl create ns coder-workspaces
 
+# remove this once
+# https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt/pull/212
+# merges and a new release is cut
+echo "WARNING: you are patching the image version for the cluster-api-provider-kubevirt (capk-system/deployment/capk-controller-manager)"
+kubectl -n capk-system \
+	patch deployment capk-controller-manager \
+	--type=json -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value":"ghcr.io/ii/cluster-api-provider-kubevirt@sha256:c1030577c70b4797fa1d3a8b56aa2a7009da2960e4a7d40f0528c3a9f376f604"}]'
+
 #TODO : upload / update the kubernetes template
