@@ -17,12 +17,21 @@ import (
 )
 
 // Entitlements processes licenses to return whether features are enabled or not.
-func Entitlements(ctx context.Context, db database.Store, logger slog.Logger, keys map[string]ed25519.PublicKey, enablements map[string]bool) (codersdk.Entitlements, error) {
+func Entitlements(
+	ctx context.Context,
+	db database.Store,
+	logger slog.Logger,
+	replicaCount int,
+	gitAuthCount int,
+	keys map[string]ed25519.PublicKey,
+	enablements map[string]bool,
+) (codersdk.Entitlements, error) {
 	now := time.Now()
 	// Default all entitlements to be disabled.
 	entitlements := codersdk.Entitlements{
 		Features: map[string]codersdk.Feature{},
 		Warnings: []string{},
+		Errors:   []string{},
 	}
 	for _, featureName := range codersdk.FeatureNames {
 		entitlements.Features[featureName] = codersdk.Feature{
@@ -45,7 +54,7 @@ func Entitlements(ctx context.Context, db database.Store, logger slog.Logger, ke
 
 	// Here we loop through licenses to detect enabled features.
 	for _, l := range licenses {
-		claims, err := validateDBLicense(l, keys)
+		claims, err := ParseClaims(l.JWT, keys)
 		if err != nil {
 			logger.Debug(ctx, "skipping invalid license",
 				slog.F("id", l.ID), slog.Error(err))
@@ -90,16 +99,34 @@ func Entitlements(ctx context.Context, db database.Store, logger slog.Logger, ke
 				Enabled:     enablements[codersdk.FeatureSCIM],
 			}
 		}
-		if claims.Features.WorkspaceQuota > 0 {
-			entitlements.Features[codersdk.FeatureWorkspaceQuota] = codersdk.Feature{
+		if claims.Features.HighAvailability > 0 {
+			entitlements.Features[codersdk.FeatureHighAvailability] = codersdk.Feature{
 				Entitlement: entitlement,
-				Enabled:     enablements[codersdk.FeatureWorkspaceQuota],
+				Enabled:     enablements[codersdk.FeatureHighAvailability],
 			}
 		}
 		if claims.Features.TemplateRBAC > 0 {
 			entitlements.Features[codersdk.FeatureTemplateRBAC] = codersdk.Feature{
 				Entitlement: entitlement,
 				Enabled:     enablements[codersdk.FeatureTemplateRBAC],
+			}
+		}
+		if claims.Features.MultipleGitAuth > 0 {
+			entitlements.Features[codersdk.FeatureMultipleGitAuth] = codersdk.Feature{
+				Entitlement: entitlement,
+				Enabled:     true,
+			}
+		}
+		if claims.Features.ExternalProvisionerDaemons > 0 {
+			entitlements.Features[codersdk.FeatureExternalProvisionerDaemons] = codersdk.Feature{
+				Entitlement: entitlement,
+				Enabled:     true,
+			}
+		}
+		if claims.Features.ServiceBanners > 0 {
+			entitlements.Features[codersdk.FeatureServiceBanners] = codersdk.Feature{
+				Entitlement: entitlement,
+				Enabled:     true,
 			}
 		}
 		if claims.AllFeatures {
@@ -132,6 +159,14 @@ func Entitlements(ctx context.Context, db database.Store, logger slog.Logger, ke
 			if featureName == codersdk.FeatureUserLimit {
 				continue
 			}
+			// High availability has it's own warnings based on replica count!
+			if featureName == codersdk.FeatureHighAvailability {
+				continue
+			}
+			// Multiple Git auth has it's own warnings based on the number configured!
+			if featureName == codersdk.FeatureMultipleGitAuth {
+				continue
+			}
 			feature := entitlements.Features[featureName]
 			if !feature.Enabled {
 				continue
@@ -141,14 +176,58 @@ func Entitlements(ctx context.Context, db database.Store, logger slog.Logger, ke
 			case codersdk.EntitlementNotEntitled:
 				entitlements.Warnings = append(entitlements.Warnings,
 					fmt.Sprintf("%s is enabled but your license is not entitled to this feature.", niceName))
-				// Disable the feature and add a warning...
-				feature.Enabled = false
-				entitlements.Features[featureName] = feature
 			case codersdk.EntitlementGracePeriod:
 				entitlements.Warnings = append(entitlements.Warnings,
 					fmt.Sprintf("%s is enabled but your license for this feature is expired.", niceName))
 			default:
 			}
+		}
+	}
+
+	if replicaCount > 1 {
+		feature := entitlements.Features[codersdk.FeatureHighAvailability]
+
+		switch feature.Entitlement {
+		case codersdk.EntitlementNotEntitled:
+			if entitlements.HasLicense {
+				entitlements.Errors = append(entitlements.Errors,
+					"You have multiple replicas but your license is not entitled to high availability. You will be unable to connect to workspaces.")
+			} else {
+				entitlements.Errors = append(entitlements.Errors,
+					"You have multiple replicas but high availability is an Enterprise feature. You will be unable to connect to workspaces.")
+			}
+		case codersdk.EntitlementGracePeriod:
+			entitlements.Warnings = append(entitlements.Warnings,
+				"You have multiple replicas but your license for high availability is expired. Reduce to one replica or workspace connections will stop working.")
+		}
+	}
+
+	if gitAuthCount > 1 {
+		feature := entitlements.Features[codersdk.FeatureMultipleGitAuth]
+
+		switch feature.Entitlement {
+		case codersdk.EntitlementNotEntitled:
+			if entitlements.HasLicense {
+				entitlements.Errors = append(entitlements.Errors,
+					"You have multiple Git authorizations configured but your license is limited at one.",
+				)
+			} else {
+				entitlements.Errors = append(entitlements.Errors,
+					"You have multiple Git authorizations configured but this is an Enterprise feature. Reduce to one.",
+				)
+			}
+		case codersdk.EntitlementGracePeriod:
+			entitlements.Warnings = append(entitlements.Warnings,
+				"You have multiple Git authorizations configured but your license is expired. Reduce to one.",
+			)
+		}
+	}
+
+	for _, featureName := range codersdk.FeatureNames {
+		feature := entitlements.Features[featureName]
+		if feature.Entitlement == codersdk.EntitlementNotEntitled {
+			feature.Enabled = false
+			entitlements.Features[featureName] = feature
 		}
 	}
 
@@ -171,12 +250,15 @@ var (
 )
 
 type Features struct {
-	UserLimit      int64 `json:"user_limit"`
-	AuditLog       int64 `json:"audit_log"`
-	BrowserOnly    int64 `json:"browser_only"`
-	SCIM           int64 `json:"scim"`
-	WorkspaceQuota int64 `json:"workspace_quota"`
-	TemplateRBAC   int64 `json:"template_rbac"`
+	UserLimit                  int64 `json:"user_limit"`
+	AuditLog                   int64 `json:"audit_log"`
+	BrowserOnly                int64 `json:"browser_only"`
+	SCIM                       int64 `json:"scim"`
+	TemplateRBAC               int64 `json:"template_rbac"`
+	HighAvailability           int64 `json:"high_availability"`
+	MultipleGitAuth            int64 `json:"multiple_git_auth"`
+	ExternalProvisionerDaemons int64 `json:"external_provisioner_daemons"`
+	ServiceBanners             int64 `json:"service_banners"`
 }
 
 type Claims struct {
@@ -195,8 +277,8 @@ type Claims struct {
 	Features       Features         `json:"features"`
 }
 
-// Parse consumes a license and returns the claims.
-func Parse(l string, keys map[string]ed25519.PublicKey) (jwt.MapClaims, error) {
+// ParseRaw consumes a license and returns the claims.
+func ParseRaw(l string, keys map[string]ed25519.PublicKey) (jwt.MapClaims, error) {
 	tok, err := jwt.Parse(
 		l,
 		keyFunc(keys),
@@ -218,11 +300,11 @@ func Parse(l string, keys map[string]ed25519.PublicKey) (jwt.MapClaims, error) {
 	return nil, xerrors.New("unable to parse Claims")
 }
 
-// validateDBLicense validates a database.License record, and if valid, returns the claims.  If
+// ParseClaims validates a database.License record, and if valid, returns the claims.  If
 // unparsable or invalid, it returns an error
-func validateDBLicense(l database.License, keys map[string]ed25519.PublicKey) (*Claims, error) {
+func ParseClaims(rawJWT string, keys map[string]ed25519.PublicKey) (*Claims, error) {
 	tok, err := jwt.ParseWithClaims(
-		l.JWT,
+		rawJWT,
 		&Claims{},
 		keyFunc(keys),
 		jwt.WithValidMethods(ValidMethods),

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
@@ -23,25 +24,17 @@ type PostWorkspaceAgentAppHealth func(context.Context, codersdk.PostWorkspaceApp
 type WorkspaceAppHealthReporter func(ctx context.Context)
 
 // NewWorkspaceAppHealthReporter creates a WorkspaceAppHealthReporter that reports app health to coderd.
-func NewWorkspaceAppHealthReporter(logger slog.Logger, workspaceAgentApps WorkspaceAgentApps, postWorkspaceAgentAppHealth PostWorkspaceAgentAppHealth) WorkspaceAppHealthReporter {
+func NewWorkspaceAppHealthReporter(logger slog.Logger, apps []codersdk.WorkspaceApp, postWorkspaceAgentAppHealth PostWorkspaceAgentAppHealth) WorkspaceAppHealthReporter {
 	runHealthcheckLoop := func(ctx context.Context) error {
-		apps, err := workspaceAgentApps(ctx)
-		if err != nil {
-			if xerrors.Is(err, context.Canceled) {
-				return nil
-			}
-			return xerrors.Errorf("getting workspace apps: %w", err)
-		}
-
 		// no need to run this loop if no apps for this workspace.
 		if len(apps) == 0 {
 			return nil
 		}
 
 		hasHealthchecksEnabled := false
-		health := make(map[string]codersdk.WorkspaceAppHealth, 0)
+		health := make(map[uuid.UUID]codersdk.WorkspaceAppHealth, 0)
 		for _, app := range apps {
-			health[app.Name] = app.Health
+			health[app.ID] = app.Health
 			if !hasHealthchecksEnabled && app.Health != codersdk.WorkspaceAppHealthDisabled {
 				hasHealthchecksEnabled = true
 			}
@@ -54,14 +47,16 @@ func NewWorkspaceAppHealthReporter(logger slog.Logger, workspaceAgentApps Worksp
 
 		// run a ticker for each app health check.
 		var mu sync.RWMutex
-		failures := make(map[string]int, 0)
+		failures := make(map[uuid.UUID]int, 0)
 		for _, nextApp := range apps {
 			if !shouldStartTicker(nextApp) {
 				continue
 			}
 			app := nextApp
-			t := time.NewTicker(time.Duration(app.Healthcheck.Interval) * time.Second)
 			go func() {
+				t := time.NewTicker(time.Duration(app.Healthcheck.Interval) * time.Second)
+				defer t.Stop()
+
 				for {
 					select {
 					case <-ctx.Done():
@@ -91,21 +86,21 @@ func NewWorkspaceAppHealthReporter(logger slog.Logger, workspaceAgentApps Worksp
 					}()
 					if err != nil {
 						mu.Lock()
-						if failures[app.Name] < int(app.Healthcheck.Threshold) {
+						if failures[app.ID] < int(app.Healthcheck.Threshold) {
 							// increment the failure count and keep status the same.
 							// we will change it when we hit the threshold.
-							failures[app.Name]++
+							failures[app.ID]++
 						} else {
 							// set to unhealthy if we hit the failure threshold.
 							// we stop incrementing at the threshold to prevent the failure value from increasing forever.
-							health[app.Name] = codersdk.WorkspaceAppHealthUnhealthy
+							health[app.ID] = codersdk.WorkspaceAppHealthUnhealthy
 						}
 						mu.Unlock()
 					} else {
 						mu.Lock()
 						// we only need one successful health check to be considered healthy.
-						health[app.Name] = codersdk.WorkspaceAppHealthHealthy
-						failures[app.Name] = 0
+						health[app.ID] = codersdk.WorkspaceAppHealthHealthy
+						failures[app.ID] = 0
 						mu.Unlock()
 					}
 
@@ -118,6 +113,7 @@ func NewWorkspaceAppHealthReporter(logger slog.Logger, workspaceAgentApps Worksp
 		lastHealth := copyHealth(health)
 		mu.Unlock()
 		reportTicker := time.NewTicker(time.Second)
+		defer reportTicker.Stop()
 		// every second we check if the health values of the apps have changed
 		// and if there is a change we will report the new values.
 		for {
@@ -160,7 +156,7 @@ func shouldStartTicker(app codersdk.WorkspaceApp) bool {
 	return app.Healthcheck.URL != "" && app.Healthcheck.Interval > 0 && app.Healthcheck.Threshold > 0
 }
 
-func healthChanged(old map[string]codersdk.WorkspaceAppHealth, new map[string]codersdk.WorkspaceAppHealth) bool {
+func healthChanged(old map[uuid.UUID]codersdk.WorkspaceAppHealth, new map[uuid.UUID]codersdk.WorkspaceAppHealth) bool {
 	for name, newValue := range new {
 		oldValue, found := old[name]
 		if !found {
@@ -174,8 +170,8 @@ func healthChanged(old map[string]codersdk.WorkspaceAppHealth, new map[string]co
 	return false
 }
 
-func copyHealth(h1 map[string]codersdk.WorkspaceAppHealth) map[string]codersdk.WorkspaceAppHealth {
-	h2 := make(map[string]codersdk.WorkspaceAppHealth, 0)
+func copyHealth(h1 map[uuid.UUID]codersdk.WorkspaceAppHealth) map[uuid.UUID]codersdk.WorkspaceAppHealth {
+	h2 := make(map[uuid.UUID]codersdk.WorkspaceAppHealth, 0)
 	for k, v := range h1 {
 		h2[k] = v
 	}

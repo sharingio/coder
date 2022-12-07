@@ -11,15 +11,19 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/spf13/afero"
+	"github.com/valyala/fasthttp/fasthttputil"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.11.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
 	"github.com/coder/coder/coderd/tracing"
+	"github.com/coder/coder/cryptorand"
 	"github.com/coder/coder/provisionerd/proto"
 	"github.com/coder/coder/provisionerd/runner"
 	sdkproto "github.com/coder/coder/provisionersdk/proto"
@@ -41,39 +45,58 @@ type Provisioners map[string]sdkproto.DRPCProvisionerClient
 
 // Options provides customizations to the behavior of a provisioner daemon.
 type Options struct {
-	Filesystem afero.Fs
-	Logger     slog.Logger
-	Tracer     trace.TracerProvider
+	Filesystem     afero.Fs
+	Logger         slog.Logger
+	TracerProvider trace.TracerProvider
+	Metrics        *Metrics
 
 	ForceCancelInterval time.Duration
 	UpdateInterval      time.Duration
-	PollInterval        time.Duration
+	LogBufferInterval   time.Duration
+	JobPollInterval     time.Duration
+	JobPollJitter       time.Duration
+	JobPollDebounce     time.Duration
 	Provisioners        Provisioners
-	WorkDirectory       string
+	// WorkDirectory must not be used by multiple processes at once.
+	WorkDirectory string
 }
 
 // New creates and starts a provisioner daemon.
 func New(clientDialer Dialer, opts *Options) *Server {
-	if opts.PollInterval == 0 {
-		opts.PollInterval = 5 * time.Second
+	if opts == nil {
+		opts = &Options{}
+	}
+	if opts.JobPollInterval == 0 {
+		opts.JobPollInterval = 5 * time.Second
+	}
+	if opts.JobPollJitter == 0 {
+		opts.JobPollJitter = time.Second
 	}
 	if opts.UpdateInterval == 0 {
 		opts.UpdateInterval = 5 * time.Second
 	}
 	if opts.ForceCancelInterval == 0 {
-		opts.ForceCancelInterval = time.Minute
+		opts.ForceCancelInterval = 10 * time.Minute
+	}
+	if opts.LogBufferInterval == 0 {
+		opts.LogBufferInterval = 50 * time.Millisecond
 	}
 	if opts.Filesystem == nil {
 		opts.Filesystem = afero.NewOsFs()
 	}
-	if opts.Tracer == nil {
-		opts.Tracer = trace.NewNoopTracerProvider()
+	if opts.TracerProvider == nil {
+		opts.TracerProvider = trace.NewNoopTracerProvider()
+	}
+	if opts.Metrics == nil {
+		reg := prometheus.NewRegistry()
+		mets := NewMetrics(reg)
+		opts.Metrics = &mets
 	}
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	daemon := &Server{
 		opts:   opts,
-		tracer: opts.Tracer.Tracer(tracing.TracerName),
+		tracer: opts.TracerProvider.Tracer(tracing.TracerName),
 
 		clientDialer: clientDialer,
 
@@ -101,6 +124,44 @@ type Server struct {
 	closeError   error
 	shutdown     chan struct{}
 	activeJob    *runner.Runner
+}
+
+type Metrics struct {
+	Runner runner.Metrics
+}
+
+func NewMetrics(reg prometheus.Registerer) Metrics {
+	auto := promauto.With(reg)
+	durationToFloatMs := func(d time.Duration) float64 {
+		return float64(d.Milliseconds())
+	}
+
+	return Metrics{
+		Runner: runner.Metrics{
+			ConcurrentJobs: auto.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "coderd",
+				Subsystem: "provisionerd",
+				Name:      "jobs_current",
+				Help:      "The number of currently running provisioner jobs.",
+			}, []string{"provisioner"}),
+			JobTimings: auto.NewHistogramVec(prometheus.HistogramOpts{
+				Namespace: "coderd",
+				Subsystem: "provisionerd",
+				Name:      "job_timings_ms",
+				Help:      "The provisioner job time duration.",
+				Buckets: []float64{
+					durationToFloatMs(1 * time.Second),
+					durationToFloatMs(10 * time.Second),
+					durationToFloatMs(30 * time.Second),
+					durationToFloatMs(1 * time.Minute),
+					durationToFloatMs(5 * time.Minute),
+					durationToFloatMs(10 * time.Minute),
+					durationToFloatMs(30 * time.Minute),
+					durationToFloatMs(1 * time.Hour),
+				},
+			}, []string{"provisioner", "status"}),
+		},
+	}
 }
 
 // Connect establishes a connection to coderd.
@@ -153,8 +214,8 @@ func (p *Server) connect(ctx context.Context) {
 		if p.isClosed() {
 			return
 		}
-		ticker := time.NewTicker(p.opts.PollInterval)
-		defer ticker.Stop()
+		timer := time.NewTimer(p.opts.JobPollInterval)
+		defer timer.Stop()
 		for {
 			client, ok := p.client()
 			if !ok {
@@ -165,11 +226,21 @@ func (p *Server) connect(ctx context.Context) {
 				return
 			case <-client.DRPCConn().Closed():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				p.acquireJob(ctx)
+				timer.Reset(p.nextInterval())
 			}
 		}
 	}()
+}
+
+func (p *Server) nextInterval() time.Duration {
+	r, err := cryptorand.Float64()
+	if err != nil {
+		panic("get random float:" + err.Error())
+	}
+
+	return p.opts.JobPollInterval + time.Duration(float64(p.opts.JobPollJitter)*r)
 }
 
 func (p *Server) client() (proto.DRPCProvisionerDaemonClient, bool) {
@@ -194,6 +265,11 @@ func (p *Server) isRunningJob() bool {
 	}
 }
 
+var (
+	lastAcquire      time.Time
+	lastAcquireMutex sync.RWMutex
+)
+
 // Locks a job in the database, and runs it!
 func (p *Server) acquireJob(ctx context.Context) {
 	p.mutex.Lock()
@@ -209,6 +285,18 @@ func (p *Server) acquireJob(ctx context.Context) {
 		return
 	}
 
+	// This prevents loads of provisioner daemons from consistently sending
+	// requests when no jobs are available.
+	//
+	// The debounce only occurs when no job is returned, so if loads of jobs are
+	// added at once, they will start after at most this duration.
+	lastAcquireMutex.RLock()
+	if !lastAcquire.IsZero() && time.Since(lastAcquire) < p.opts.JobPollDebounce {
+		lastAcquireMutex.RUnlock()
+		return
+	}
+	lastAcquireMutex.RUnlock()
+
 	var err error
 	client, ok := p.client()
 	if !ok {
@@ -217,10 +305,9 @@ func (p *Server) acquireJob(ctx context.Context) {
 
 	job, err := client.AcquireJob(ctx, &proto.Empty{})
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-		if errors.Is(err, yamux.ErrSessionShutdown) {
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, yamux.ErrSessionShutdown) ||
+			errors.Is(err, fasthttputil.ErrInmemoryListenerClosed) {
 			return
 		}
 
@@ -228,6 +315,9 @@ func (p *Server) acquireJob(ctx context.Context) {
 		return
 	}
 	if job.JobId == "" {
+		lastAcquireMutex.Lock()
+		lastAcquire = time.Now()
+		lastAcquireMutex.Unlock()
 		return
 	}
 
@@ -271,24 +361,29 @@ func (p *Server) acquireJob(ctx context.Context) {
 		return
 	}
 
-	p.activeJob = runner.NewRunner(
+	p.activeJob = runner.New(
 		ctx,
 		job,
-		p,
-		p.opts.Logger,
-		p.opts.Filesystem,
-		p.opts.WorkDirectory,
-		provisioner,
-		p.opts.UpdateInterval,
-		p.opts.ForceCancelInterval,
-		p.tracer,
+		runner.Options{
+			Updater:             p,
+			QuotaCommitter:      p,
+			Logger:              p.opts.Logger,
+			Filesystem:          p.opts.Filesystem,
+			WorkDirectory:       p.opts.WorkDirectory,
+			Provisioner:         provisioner,
+			UpdateInterval:      p.opts.UpdateInterval,
+			ForceCancelInterval: p.opts.ForceCancelInterval,
+			LogDebounceInterval: p.opts.LogBufferInterval,
+			Tracer:              p.tracer,
+			Metrics:             p.opts.Metrics.Runner,
+		},
 	)
 
 	go p.activeJob.Run()
 }
 
 func retryable(err error) bool {
-	return xerrors.Is(err, yamux.ErrSessionShutdown) || xerrors.Is(err, io.EOF) ||
+	return xerrors.Is(err, yamux.ErrSessionShutdown) || xerrors.Is(err, io.EOF) || xerrors.Is(err, fasthttputil.ErrInmemoryListenerClosed) ||
 		// annoyingly, dRPC sometimes returns context.Canceled if the transport was closed, even if the context for
 		// the RPC *is not canceled*.  Retrying is fine if the RPC context is not canceled.
 		xerrors.Is(err, context.Canceled)
@@ -311,6 +406,17 @@ func (p *Server) clientDoWithRetries(
 		return resp, err
 	}
 	return nil, ctx.Err()
+}
+
+func (p *Server) CommitQuota(ctx context.Context, in *proto.CommitQuotaRequest) (*proto.CommitQuotaResponse, error) {
+	out, err := p.clientDoWithRetries(ctx, func(ctx context.Context, client proto.DRPCProvisionerDaemonClient) (any, error) {
+		return client.CommitQuota(ctx, in)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// nolint: forcetypeassert
+	return out.(*proto.CommitQuotaResponse), nil
 }
 
 func (p *Server) UpdateJob(ctx context.Context, in *proto.UpdateJobRequest) (*proto.UpdateJobResponse, error) {

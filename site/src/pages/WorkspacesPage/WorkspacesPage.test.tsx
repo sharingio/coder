@@ -1,11 +1,16 @@
-import { screen } from "@testing-library/react"
+import { screen, waitFor } from "@testing-library/react"
 import { rest } from "msw"
 import * as CreateDayString from "util/createDayString"
-import { Language as WorkspacesTableBodyLanguage } from "../../components/WorkspacesTable/WorkspacesTableBody"
-import { MockWorkspace } from "../../testHelpers/entities"
+import {
+  MockWorkspace,
+  MockWorkspacesResponse,
+} from "../../testHelpers/entities"
 import { history, render } from "../../testHelpers/renderHelpers"
 import { server } from "../../testHelpers/server"
 import WorkspacesPage from "./WorkspacesPage"
+import { i18n } from "i18n"
+
+const { t } = i18n
 
 describe("WorkspacesPage", () => {
   beforeEach(() => {
@@ -19,7 +24,7 @@ describe("WorkspacesPage", () => {
     // Given
     server.use(
       rest.get("/api/v2/workspaces", async (req, res, ctx) => {
-        return res(ctx.status(200), ctx.json([]))
+        return res(ctx.status(200), ctx.json({ workspaces: [], count: 0 }))
       }),
     )
 
@@ -27,16 +32,34 @@ describe("WorkspacesPage", () => {
     render(<WorkspacesPage />)
 
     // Then
-    await screen.findByText(
-      WorkspacesTableBodyLanguage.emptyCreateWorkspaceMessage,
-    )
+    const text = t("emptyCreateWorkspaceMessage", { ns: "workspacesPage" })
+    await screen.findByText(text)
   })
 
   it("renders a filled workspaces page", async () => {
     // When
-    render(<WorkspacesPage />)
+    const { container } = render(<WorkspacesPage />)
 
     // Then
-    await screen.findByText(MockWorkspace.name)
+    const nextPage = await screen.findByRole("button", { name: "Next page" })
+    expect(nextPage).toBeEnabled()
+    await waitFor(
+      async () => {
+        const prevPage = await screen.findByRole("button", {
+          name: "Previous page",
+        })
+        expect(prevPage).toBeDisabled()
+        const pageButtons = await container.querySelectorAll(
+          `button[name="Page button"]`,
+        )
+        expect(pageButtons.length).toBe(2)
+      },
+      { timeout: 2000 },
+    )
+    await screen.findByText(`${MockWorkspace.name}1`)
+    const templateDisplayNames = await screen.findAllByText(
+      `${MockWorkspace.template_display_name}`,
+    )
+    expect(templateDisplayNames).toHaveLength(MockWorkspacesResponse.count)
   })
 })

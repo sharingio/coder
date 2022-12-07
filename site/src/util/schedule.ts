@@ -1,3 +1,5 @@
+import map from "lodash/map"
+import some from "lodash/some"
 import cronstrue from "cronstrue"
 import dayjs, { Dayjs } from "dayjs"
 import advancedFormat from "dayjs/plugin/advancedFormat"
@@ -7,6 +9,9 @@ import timezone from "dayjs/plugin/timezone"
 import utc from "dayjs/plugin/utc"
 import { Template, Workspace } from "../api/typesGenerated"
 import { isWorkspaceOn } from "./workspace"
+import { WorkspaceScheduleFormValues } from "components/WorkspaceScheduleForm/WorkspaceScheduleForm"
+import { AutoStop } from "pages/WorkspaceSchedulePage/ttl"
+import { AutoStart } from "pages/WorkspaceSchedulePage/schedule"
 
 // REMARK: some plugins depend on utc, so it's listed first. Otherwise they're
 //         sorted alphabetically.
@@ -139,7 +144,7 @@ export function getMaxDeadline(
   }
   const startedAt = dayjs(ws.latest_build.updated_at)
   const maxTemplateDeadline = startedAt.add(
-    dayjs.duration(tpl.max_ttl_ms, "milliseconds"),
+    dayjs.duration(tpl.default_ttl_ms, "milliseconds"),
   )
   const maxGlobalDeadline = startedAt.add(deadlineExtensionMax)
   return dayjs.min(maxTemplateDeadline, maxGlobalDeadline)
@@ -167,3 +172,27 @@ export function canReduceDeadline(deadline: dayjs.Dayjs): boolean {
 
 export const getDeadline = (workspace: Workspace): dayjs.Dayjs =>
   dayjs(workspace.latest_build.deadline).utc()
+
+/**
+ * Get number of hours you can add or subtract to the current deadline before hitting the max or min deadline.
+ * @param deadline
+ * @param workspace
+ * @param template
+ * @returns number, in hours
+ */
+export const getMaxDeadlineChange = (
+  deadline: dayjs.Dayjs,
+  extremeDeadline: dayjs.Dayjs,
+): number => Math.abs(deadline.diff(extremeDeadline, "hours"))
+
+export const scheduleChanged = (
+  initialValues: AutoStart | AutoStop,
+  formValues: WorkspaceScheduleFormValues,
+): boolean =>
+  some(
+    map(
+      { ...initialValues },
+      (v: boolean | string, k: keyof typeof initialValues) =>
+        formValues[k] !== v,
+    ),
+  )

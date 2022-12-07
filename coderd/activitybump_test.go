@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"cdr.dev/slog/sloggers/slogtest"
-
 	"github.com/coder/coder/coderd/coderdtest"
 	"github.com/coder/coder/coderd/database"
 	"github.com/coder/coder/codersdk"
@@ -23,7 +22,15 @@ func TestWorkspaceActivityBump(t *testing.T) {
 	setupActivityTest := func(t *testing.T) (client *codersdk.Client, workspace codersdk.Workspace, assertBumped func(want bool)) {
 		var ttlMillis int64 = 60 * 1000
 
-		client, _, workspace, _ = setupProxyTest(t, func(cwr *codersdk.CreateWorkspaceRequest) {
+		client = coderdtest.New(t, &coderdtest.Options{
+			AppHostname:                 proxyTestSubdomainRaw,
+			IncludeProvisionerDaemon:    true,
+			AgentStatsRefreshInterval:   time.Millisecond * 100,
+			MetricsCacheRefreshInterval: time.Millisecond * 100,
+		})
+		user := coderdtest.CreateFirstUser(t, client)
+
+		workspace = createWorkspaceWithApps(t, client, user.OrganizationID, "", 1234, func(cwr *codersdk.CreateWorkspaceRequest) {
 			cwr.TTLMillis = &ttlMillis
 		})
 
@@ -64,7 +71,7 @@ func TestWorkspaceActivityBump(t *testing.T) {
 				"deadline %v never updated", firstDeadline,
 			)
 
-			require.WithinDuration(t, database.Now().Add(time.Hour), workspace.LatestBuild.Deadline.Time, time.Second)
+			require.WithinDuration(t, database.Now().Add(time.Hour), workspace.LatestBuild.Deadline.Time, 3*time.Second)
 		}
 	}
 
@@ -74,11 +81,13 @@ func TestWorkspaceActivityBump(t *testing.T) {
 		client, workspace, assertBumped := setupActivityTest(t)
 
 		resources := coderdtest.AwaitWorkspaceAgents(t, client, workspace.ID)
-		conn, err := client.DialWorkspaceAgentTailnet(ctx, slogtest.Make(t, nil), resources[0].Agents[0].ID)
+		conn, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID, &codersdk.DialWorkspaceAgentOptions{
+			Logger: slogtest.Make(t, nil),
+		})
 		require.NoError(t, err)
 		defer conn.Close()
 
-		sshConn, err := conn.SSHClient()
+		sshConn, err := conn.SSHClient(ctx)
 		require.NoError(t, err)
 		_ = sshConn.Close()
 

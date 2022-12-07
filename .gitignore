@@ -14,9 +14,13 @@ vendor
 .eslintcache
 yarn-error.log
 gotests.coverage
+gotests.xml
 .idea
 .gitpod.yml
 .DS_Store
+
+# Make target for updating golden files.
+cli/testdata/.gen-golden
 
 # Front-end ignore
 .next/
@@ -46,3 +50,6 @@ site/out/
 **/*.swp
 .coderv2/*
 **/__debug_bin
+
+# direnv
+.envrc

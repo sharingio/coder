@@ -9,7 +9,7 @@ WHERE
 		-- This allows using the last element on a page as effectively a cursor.
 		-- This is an important option for scripts that need to paginate without
 		-- duplicating or missing data.
-		WHEN @after_id :: uuid != '00000000-00000000-00000000-00000000' THEN (
+		WHEN @after_id :: uuid != '00000000-0000-0000-0000-000000000000'::uuid THEN (
 			-- The pagination cursor is the last ID of the previous page.
 			-- The query is ordered by the created_at field, so select all
 			-- rows after the cursor.
@@ -52,6 +52,15 @@ WHERE
 	template_id = $1
 	AND "name" = $2;
 
+-- name: GetTemplateVersionByOrganizationAndName :one
+SELECT
+	*
+FROM
+	template_versions
+WHERE
+	organization_id = $1
+	AND "name" = $2;
+
 -- name: GetTemplateVersionByID :one
 SELECT
 	*
@@ -59,6 +68,14 @@ FROM
 	template_versions
 WHERE
 	id = $1;
+
+-- name: GetTemplateVersionsByIDs :many
+SELECT
+	*
+FROM
+	template_versions
+WHERE
+	id = ANY(@ids :: uuid [ ]);
 
 -- name: InsertTemplateVersion :one
 INSERT INTO
@@ -93,3 +110,17 @@ SET
 	updated_at = $3
 WHERE
 	job_id = $1;
+
+-- name: GetPreviousTemplateVersion :one
+SELECT
+	*
+FROM
+	template_versions
+WHERE
+	created_at < (
+		SELECT created_at
+		FROM template_versions AS tv
+		WHERE tv.organization_id = $1 AND tv.name = $2 AND tv.template_id = $3
+	)
+ORDER BY created_at DESC
+LIMIT 1;

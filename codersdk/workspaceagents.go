@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -17,11 +18,9 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/xerrors"
 	"nhooyr.io/websocket"
-	"nhooyr.io/websocket/wsjson"
 	"tailscale.com/tailcfg"
 
 	"cdr.dev/slog"
-
 	"github.com/coder/coder/tailnet"
 	"github.com/coder/retry"
 )
@@ -32,6 +31,7 @@ const (
 	WorkspaceAgentConnecting   WorkspaceAgentStatus = "connecting"
 	WorkspaceAgentConnected    WorkspaceAgentStatus = "connected"
 	WorkspaceAgentDisconnected WorkspaceAgentStatus = "disconnected"
+	WorkspaceAgentTimeout      WorkspaceAgentStatus = "timeout"
 )
 
 type WorkspaceAgent struct {
@@ -53,7 +53,9 @@ type WorkspaceAgent struct {
 	Version              string               `json:"version"`
 	Apps                 []WorkspaceApp       `json:"apps"`
 	// DERPLatency is mapped by region name (e.g. "New York City", "Seattle").
-	DERPLatency map[string]DERPRegion `json:"latency,omitempty"`
+	DERPLatency              map[string]DERPRegion `json:"latency,omitempty"`
+	ConnectionTimeoutSeconds int32                 `json:"connection_timeout_seconds"`
+	TroubleshootingURL       string                `json:"troubleshooting_url"`
 }
 
 type WorkspaceAgentResourceMetadata struct {
@@ -119,10 +121,17 @@ type PostWorkspaceAgentVersionRequest struct {
 
 // @typescript-ignore WorkspaceAgentMetadata
 type WorkspaceAgentMetadata struct {
+	// GitAuthConfigs stores the number of Git configurations
+	// the Coder deployment has. If this number is >0, we
+	// set up special configuration in the workspace.
+	GitAuthConfigs       int               `json:"git_auth_configs"`
+	VSCodePortProxyURI   string            `json:"vscode_port_proxy_uri"`
+	Apps                 []WorkspaceApp    `json:"apps"`
 	DERPMap              *tailcfg.DERPMap  `json:"derpmap"`
 	EnvironmentVariables map[string]string `json:"environment_variables"`
 	StartupScript        string            `json:"startup_script"`
 	Directory            string            `json:"directory"`
+	MOTDFile             string            `json:"motd_file"`
 }
 
 // AuthWorkspaceGoogleInstanceIdentity uses the Google Compute Engine Metadata API to
@@ -302,7 +311,7 @@ func (c *Client) WorkspaceAgentMetadata(ctx context.Context) (WorkspaceAgentMeta
 	return agentMetadata, nil
 }
 
-func (c *Client) ListenWorkspaceAgentTailnet(ctx context.Context) (net.Conn, error) {
+func (c *Client) ListenWorkspaceAgent(ctx context.Context) (net.Conn, error) {
 	coordinateURL, err := c.URL.Parse("/api/v2/workspaceagents/me/coordinate")
 	if err != nil {
 		return nil, xerrors.Errorf("parse url: %w", err)
@@ -313,10 +322,11 @@ func (c *Client) ListenWorkspaceAgentTailnet(ctx context.Context) (net.Conn, err
 	}
 	jar.SetCookies(coordinateURL, []*http.Cookie{{
 		Name:  SessionTokenKey,
-		Value: c.SessionToken,
+		Value: c.SessionToken(),
 	}})
 	httpClient := &http.Client{
-		Jar: jar,
+		Jar:       jar,
+		Transport: c.HTTPClient.Transport,
 	}
 	// nolint:bodyclose
 	conn, res, err := websocket.Dial(ctx, coordinateURL.String(), &websocket.DialOptions{
@@ -332,7 +342,17 @@ func (c *Client) ListenWorkspaceAgentTailnet(ctx context.Context) (net.Conn, err
 	return websocket.NetConn(ctx, conn, websocket.MessageBinary), nil
 }
 
-func (c *Client) DialWorkspaceAgentTailnet(ctx context.Context, logger slog.Logger, agentID uuid.UUID) (*AgentConn, error) {
+// @typescript-ignore DialWorkspaceAgentOptions
+type DialWorkspaceAgentOptions struct {
+	Logger slog.Logger
+	// BlockEndpoints forced a direct connection through DERP.
+	BlockEndpoints bool
+}
+
+func (c *Client) DialWorkspaceAgent(ctx context.Context, agentID uuid.UUID, options *DialWorkspaceAgentOptions) (*AgentConn, error) {
+	if options == nil {
+		options = &DialWorkspaceAgentOptions{}
+	}
 	res, err := c.Request(ctx, http.MethodGet, fmt.Sprintf("/api/v2/workspaceagents/%s/connection", agentID), nil)
 	if err != nil {
 		return nil, err
@@ -349,9 +369,10 @@ func (c *Client) DialWorkspaceAgentTailnet(ctx context.Context, logger slog.Logg
 
 	ip := tailnet.IP()
 	conn, err := tailnet.NewConn(&tailnet.Options{
-		Addresses: []netip.Prefix{netip.PrefixFrom(ip, 128)},
-		DERPMap:   connInfo.DERPMap,
-		Logger:    logger,
+		Addresses:      []netip.Prefix{netip.PrefixFrom(ip, 128)},
+		DERPMap:        connInfo.DERPMap,
+		Logger:         options.Logger,
+		BlockEndpoints: options.BlockEndpoints,
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("create tailnet: %w", err)
@@ -367,10 +388,11 @@ func (c *Client) DialWorkspaceAgentTailnet(ctx context.Context, logger slog.Logg
 	}
 	jar.SetCookies(coordinateURL, []*http.Cookie{{
 		Name:  SessionTokenKey,
-		Value: c.SessionToken,
+		Value: c.SessionToken(),
 	}})
 	httpClient := &http.Client{
-		Jar: jar,
+		Jar:       jar,
+		Transport: c.HTTPClient.Transport,
 	}
 	ctx, cancelFunc := context.WithCancel(ctx)
 	closed := make(chan struct{})
@@ -379,7 +401,7 @@ func (c *Client) DialWorkspaceAgentTailnet(ctx context.Context, logger slog.Logg
 		defer close(closed)
 		isFirst := true
 		for retrier := retry.New(50*time.Millisecond, 10*time.Second); retrier.Wait(ctx); {
-			logger.Debug(ctx, "connecting")
+			options.Logger.Debug(ctx, "connecting")
 			// nolint:bodyclose
 			ws, res, err := websocket.Dial(ctx, coordinateURL.String(), &websocket.DialOptions{
 				HTTPClient: httpClient,
@@ -398,21 +420,21 @@ func (c *Client) DialWorkspaceAgentTailnet(ctx context.Context, logger slog.Logg
 				if errors.Is(err, context.Canceled) {
 					return
 				}
-				logger.Debug(ctx, "failed to dial", slog.Error(err))
+				options.Logger.Debug(ctx, "failed to dial", slog.Error(err))
 				continue
 			}
 			sendNode, errChan := tailnet.ServeCoordinator(websocket.NetConn(ctx, ws, websocket.MessageBinary), func(node []*tailnet.Node) error {
 				return conn.UpdateNodes(node)
 			})
 			conn.SetNodeCallback(sendNode)
-			logger.Debug(ctx, "serving coordinator")
+			options.Logger.Debug(ctx, "serving coordinator")
 			err = <-errChan
 			if errors.Is(err, context.Canceled) {
 				_ = ws.Close(websocket.StatusGoingAway, "")
 				return
 			}
 			if err != nil {
-				logger.Debug(ctx, "error serving coordinator", slog.Error(err))
+				options.Logger.Debug(ctx, "error serving coordinator", slog.Error(err))
 				_ = ws.Close(websocket.StatusGoingAway, "")
 				continue
 			}
@@ -425,13 +447,14 @@ func (c *Client) DialWorkspaceAgentTailnet(ctx context.Context, logger slog.Logg
 		_ = conn.Close()
 		return nil, err
 	}
+
 	return &AgentConn{
 		Conn: conn,
 		CloseFunc: func() {
 			cancelFunc()
 			<-closed
 		},
-	}, err
+	}, nil
 }
 
 // WorkspaceAgent returns an agent by ID.
@@ -446,20 +469,6 @@ func (c *Client) WorkspaceAgent(ctx context.Context, id uuid.UUID) (WorkspaceAge
 	}
 	var workspaceAgent WorkspaceAgent
 	return workspaceAgent, json.NewDecoder(res.Body).Decode(&workspaceAgent)
-}
-
-// MyWorkspaceAgent returns the requesting agent.
-func (c *Client) WorkspaceAgentApps(ctx context.Context) ([]WorkspaceApp, error) {
-	res, err := c.Request(ctx, http.MethodGet, "/api/v2/workspaceagents/me/apps", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, readBodyAsError(res)
-	}
-	var workspaceApps []WorkspaceApp
-	return workspaceApps, json.NewDecoder(res.Body).Decode(&workspaceApps)
 }
 
 // PostWorkspaceAgentAppHealth updates the workspace agent app health status.
@@ -492,18 +501,25 @@ func (c *Client) PostWorkspaceAgentVersion(ctx context.Context, version string) 
 // WorkspaceAgentReconnectingPTY spawns a PTY that reconnects using the token provided.
 // It communicates using `agent.ReconnectingPTYRequest` marshaled as JSON.
 // Responses are PTY output that can be rendered.
-func (c *Client) WorkspaceAgentReconnectingPTY(ctx context.Context, agentID, reconnect uuid.UUID, height, width int, command string) (net.Conn, error) {
-	serverURL, err := c.URL.Parse(fmt.Sprintf("/api/v2/workspaceagents/%s/pty?reconnect=%s&height=%d&width=%d&command=%s", agentID, reconnect, height, width, command))
+func (c *Client) WorkspaceAgentReconnectingPTY(ctx context.Context, agentID, reconnect uuid.UUID, height, width uint16, command string) (net.Conn, error) {
+	serverURL, err := c.URL.Parse(fmt.Sprintf("/api/v2/workspaceagents/%s/pty", agentID))
 	if err != nil {
 		return nil, xerrors.Errorf("parse url: %w", err)
 	}
+	q := serverURL.Query()
+	q.Set("reconnect", reconnect.String())
+	q.Set("height", strconv.Itoa(int(height)))
+	q.Set("width", strconv.Itoa(int(width)))
+	q.Set("command", command)
+	serverURL.RawQuery = q.Encode()
+
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, xerrors.Errorf("create cookie jar: %w", err)
 	}
 	jar.SetCookies(serverURL, []*http.Cookie{{
 		Name:  SessionTokenKey,
-		Value: c.SessionToken,
+		Value: c.SessionToken(),
 	}})
 	httpClient := &http.Client{
 		Jar: jar,
@@ -537,12 +553,46 @@ func (c *Client) WorkspaceAgentListeningPorts(ctx context.Context, agentID uuid.
 
 // Stats records the Agent's network connection statistics for use in
 // user-facing metrics and debugging.
-// Each member value must be written and read with atomic.
 // @typescript-ignore AgentStats
 type AgentStats struct {
+	// ConnsByProto is a count of connections by protocol.
+	ConnsByProto map[string]int64 `json:"conns_by_proto"`
+	// NumConns is the number of connections received by an agent.
 	NumConns int64 `json:"num_comms"`
-	RxBytes  int64 `json:"rx_bytes"`
-	TxBytes  int64 `json:"tx_bytes"`
+	// RxPackets is the number of received packets.
+	RxPackets int64 `json:"rx_packets"`
+	// RxBytes is the number of received bytes.
+	RxBytes int64 `json:"rx_bytes"`
+	// TxPackets is the number of transmitted bytes.
+	TxPackets int64 `json:"tx_packets"`
+	// TxBytes is the number of transmitted bytes.
+	TxBytes int64 `json:"tx_bytes"`
+}
+
+// @typescript-ignore AgentStatsResponse
+type AgentStatsResponse struct {
+	// ReportInterval is the duration after which the agent should send stats
+	// again.
+	ReportInterval time.Duration `json:"report_interval"`
+}
+
+func (c *Client) PostAgentStats(ctx context.Context, stats *AgentStats) (AgentStatsResponse, error) {
+	res, err := c.Request(ctx, http.MethodPost, "/api/v2/workspaceagents/me/report-stats", stats)
+	if err != nil {
+		return AgentStatsResponse{}, xerrors.Errorf("send request: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return AgentStatsResponse{}, readBodyAsError(res)
+	}
+
+	var interval AgentStatsResponse
+	err = json.NewDecoder(res.Body).Decode(&interval)
+	if err != nil {
+		return AgentStatsResponse{}, xerrors.Errorf("decode stats response: %w", err)
+	}
+
+	return interval, nil
 }
 
 // AgentReportStats begins a stat streaming connection with the Coder server.
@@ -550,83 +600,81 @@ type AgentStats struct {
 func (c *Client) AgentReportStats(
 	ctx context.Context,
 	log slog.Logger,
-	stats func() *AgentStats,
+	getStats func() *AgentStats,
 ) (io.Closer, error) {
-	serverURL, err := c.URL.Parse("/api/v2/workspaceagents/me/report-stats")
-	if err != nil {
-		return nil, xerrors.Errorf("parse url: %w", err)
-	}
-
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, xerrors.Errorf("create cookie jar: %w", err)
-	}
-
-	jar.SetCookies(serverURL, []*http.Cookie{{
-		Name:  SessionTokenKey,
-		Value: c.SessionToken,
-	}})
-
-	httpClient := &http.Client{
-		Jar: jar,
-	}
-
-	doneCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(ctx)
 
 	go func() {
-		defer close(doneCh)
+		// Immediately trigger a stats push to get the correct interval.
+		timer := time.NewTimer(time.Nanosecond)
+		defer timer.Stop()
 
-		// If the agent connection succeeds for a while, then fails, then succeeds
-		// for a while (etc.) the retry may hit the maximum. This is a normal
-		// case for long-running agents that experience coderd upgrades, so
-		// we use a short maximum retry limit.
-		for r := retry.New(time.Second, time.Minute); r.Wait(ctx); {
-			err = func() error {
-				conn, res, err := websocket.Dial(ctx, serverURL.String(), &websocket.DialOptions{
-					HTTPClient: httpClient,
-					// Need to disable compression to avoid a data-race.
-					CompressionMode: websocket.CompressionDisabled,
-				})
-				if err != nil {
-					if res == nil {
-						return err
-					}
-					return readBodyAsError(res)
-				}
-
-				for {
-					var req AgentStatsReportRequest
-					err := wsjson.Read(ctx, conn, &req)
-					if err != nil {
-						_ = conn.Close(websocket.StatusGoingAway, "")
-						return err
-					}
-
-					s := stats()
-
-					resp := AgentStatsReportResponse{
-						NumConns: s.NumConns,
-						RxBytes:  s.RxBytes,
-						TxBytes:  s.TxBytes,
-					}
-
-					err = wsjson.Write(ctx, conn, resp)
-					if err != nil {
-						_ = conn.Close(websocket.StatusGoingAway, "")
-						return err
-					}
-				}
-			}()
-			if err != nil && ctx.Err() == nil {
-				log.Error(ctx, "report stats", slog.Error(err))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
 			}
+
+			var nextInterval time.Duration
+			for r := retry.New(100*time.Millisecond, time.Minute); r.Wait(ctx); {
+				resp, err := c.PostAgentStats(ctx, getStats())
+				if err != nil {
+					if !xerrors.Is(err, context.Canceled) {
+						log.Error(ctx, "report stats", slog.Error(err))
+					}
+					continue
+				}
+
+				nextInterval = resp.ReportInterval
+				break
+			}
+			timer.Reset(nextInterval)
 		}
 	}()
 
 	return closeFunc(func() error {
 		cancel()
-		<-doneCh
 		return nil
 	}), nil
+}
+
+// GitProvider is a constant that represents the
+// type of providers that are supported within Coder.
+// @typescript-ignore GitProvider
+type GitProvider string
+
+const (
+	GitProviderAzureDevops = "azure-devops"
+	GitProviderGitHub      = "github"
+	GitProviderGitLab      = "gitlab"
+	GitProviderBitBucket   = "bitbucket"
+)
+
+type WorkspaceAgentGitAuthResponse struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	URL      string `json:"url"`
+}
+
+// WorkspaceAgentGitAuth submits a URL to fetch a GIT_ASKPASS username
+// and password for.
+// nolint:revive
+func (c *Client) WorkspaceAgentGitAuth(ctx context.Context, gitURL string, listen bool) (WorkspaceAgentGitAuthResponse, error) {
+	reqURL := "/api/v2/workspaceagents/me/gitauth?url=" + url.QueryEscape(gitURL)
+	if listen {
+		reqURL += "&listen"
+	}
+	res, err := c.Request(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return WorkspaceAgentGitAuthResponse{}, xerrors.Errorf("execute request: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return WorkspaceAgentGitAuthResponse{}, readBodyAsError(res)
+	}
+
+	var authResp WorkspaceAgentGitAuthResponse
+	return authResp, json.NewDecoder(res.Body).Decode(&authResp)
 }

@@ -2,7 +2,7 @@ terraform {
   required_providers {
     coder = {
       source  = "coder/coder"
-      version = "0.5.0"
+      version = "0.6.0"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
@@ -29,7 +29,6 @@ variable "namespace" {
   type        = string
   sensitive   = true
   description = "The namespace to create workspaces in (must exist prior to creating workspaces)"
-  default     = "coder-workspaces"
 }
 
 variable "home_disk_size" {
@@ -71,11 +70,13 @@ resource "coder_agent" "main" {
 
 # code-server
 resource "coder_app" "code-server" {
-  agent_id  = coder_agent.main.id
-  name      = "code-server"
-  icon      = "/icon/code.svg"
-  url       = "http://localhost:13337?folder=/home/coder"
-  subdomain = false
+  agent_id     = coder_agent.main.id
+  slug         = "code-server"
+  display_name = "code-server"
+  icon         = "/icon/code.svg"
+  url          = "http://localhost:13337?folder=/home/coder"
+  subdomain    = false
+  share        = "owner"
 
   healthcheck {
     url       = "http://localhost:13337/healthz"

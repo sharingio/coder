@@ -41,9 +41,10 @@ func TestEntitlements(t *testing.T) {
 		})
 		_ = coderdtest.CreateFirstUser(t, client)
 		coderdenttest.AddLicense(t, client, coderdenttest.LicenseOptions{
-			UserLimit:           100,
-			AuditLog:            true,
-			TemplateRBACEnabled: true,
+			UserLimit:                  100,
+			AuditLog:                   true,
+			TemplateRBAC:               true,
+			ExternalProvisionerDaemons: true,
 		})
 		res, err := client.Entitlements(context.Background())
 		require.NoError(t, err)
@@ -85,7 +86,7 @@ func TestEntitlements(t *testing.T) {
 		assert.False(t, res.HasLicense)
 		al = res.Features[codersdk.FeatureAuditLog]
 		assert.Equal(t, codersdk.EntitlementNotEntitled, al.Entitlement)
-		assert.True(t, al.Enabled)
+		assert.False(t, al.Enabled)
 	})
 	t.Run("Pubsub", func(t *testing.T) {
 		t.Parallel()
@@ -158,6 +159,9 @@ func TestAuditLogging(t *testing.T) {
 		t.Parallel()
 		client, _, api := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 			AuditLogging: true,
+			Options: &coderdtest.Options{
+				Auditor: audit.NewAuditor(audit.DefaultFilter),
+			},
 		})
 		coderdtest.CreateFirstUser(t, client)
 		coderdenttest.AddLicense(t, client, coderdenttest.LicenseOptions{

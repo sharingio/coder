@@ -10,13 +10,11 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/pion/udp"
 	"github.com/spf13/cobra"
 	"golang.org/x/xerrors"
 
-	"cdr.dev/slog"
 	"github.com/coder/coder/agent"
 	"github.com/coder/coder/cli/cliflag"
 	"github.com/coder/coder/cli/cliui"
@@ -80,7 +78,7 @@ func portForward() *cobra.Command {
 				return xerrors.New("workspace must be in start transition to port-forward")
 			}
 			if workspace.LatestBuild.Job.CompletedAt == nil {
-				err = cliui.WorkspaceBuild(ctx, cmd.ErrOrStderr(), client, workspace.LatestBuild.ID, workspace.CreatedAt)
+				err = cliui.WorkspaceBuild(ctx, cmd.ErrOrStderr(), client, workspace.LatestBuild.ID)
 				if err != nil {
 					return err
 				}
@@ -96,7 +94,7 @@ func portForward() *cobra.Command {
 				return xerrors.Errorf("await agent: %w", err)
 			}
 
-			conn, err := client.DialWorkspaceAgentTailnet(ctx, slog.Logger{}, workspaceAgent.ID)
+			conn, err := client.DialWorkspaceAgent(ctx, workspaceAgent.ID, nil)
 			if err != nil {
 				return err
 			}
@@ -139,30 +137,14 @@ func portForward() *cobra.Command {
 				case <-ctx.Done():
 					closeErr = ctx.Err()
 				case <-sigs:
-					_, _ = fmt.Fprintln(cmd.OutOrStderr(), "Received signal, closing all listeners and active connections")
-					closeErr = xerrors.New("signal received")
+					_, _ = fmt.Fprintln(cmd.OutOrStderr(), "\nReceived signal, closing all listeners and active connections")
 				}
 
 				cancel()
 				closeAllListeners()
 			}()
 
-			ticker := time.NewTicker(250 * time.Millisecond)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-ticker.C:
-				}
-
-				_, err = conn.Ping()
-				if err != nil {
-					continue
-				}
-				break
-			}
-			ticker.Stop()
+			conn.AwaitReachable(ctx)
 			_, _ = fmt.Fprintln(cmd.OutOrStderr(), "Ready!")
 			wg.Wait()
 			return closeErr
@@ -214,7 +196,11 @@ func listenAndPortForward(ctx context.Context, cmd *cobra.Command, conn *codersd
 		for {
 			netConn, err := l.Accept()
 			if err != nil {
-				_, _ = fmt.Fprintf(cmd.OutOrStderr(), "Error accepting connection from '%v://%v': %+v\n", spec.listenNetwork, spec.listenAddress, err)
+				// Silently ignore net.ErrClosed errors.
+				if xerrors.Is(err, net.ErrClosed) {
+					return
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStderr(), "Error accepting connection from '%v://%v': %v\n", spec.listenNetwork, spec.listenAddress, err)
 				_, _ = fmt.Fprintln(cmd.OutOrStderr(), "Killing listener")
 				return
 			}

@@ -4,6 +4,7 @@ import duration from "dayjs/plugin/duration"
 import minMax from "dayjs/plugin/minMax"
 import utc from "dayjs/plugin/utc"
 import semver from "semver"
+import { PaletteIndex } from "theme/palettes"
 import * as TypesGen from "../api/typesGenerated"
 
 dayjs.extend(duration)
@@ -20,8 +21,7 @@ export const DisplayWorkspaceBuildStatusLanguage = {
 }
 
 export const DisplayAgentVersionLanguage = {
-  unknown: "unknown",
-  outdated: "outdated",
+  unknown: "Unknown",
 }
 
 export const getDisplayWorkspaceBuildStatus = (
@@ -30,44 +30,46 @@ export const getDisplayWorkspaceBuildStatus = (
 ): {
   color: string
   status: string
+  type: PaletteIndex
 } => {
   switch (build.job.status) {
     case "succeeded":
       return {
+        type: "success",
         color: theme.palette.success.main,
-        status: `⦿ ${DisplayWorkspaceBuildStatusLanguage.succeeded}`,
+        status: DisplayWorkspaceBuildStatusLanguage.succeeded,
       }
     case "pending":
       return {
+        type: "secondary",
         color: theme.palette.text.secondary,
-        status: `⦿ ${DisplayWorkspaceBuildStatusLanguage.pending}`,
+        status: DisplayWorkspaceBuildStatusLanguage.pending,
       }
     case "running":
       return {
+        type: "info",
         color: theme.palette.primary.main,
-        status: `⦿ ${DisplayWorkspaceBuildStatusLanguage.running}`,
+        status: DisplayWorkspaceBuildStatusLanguage.running,
       }
     case "failed":
       return {
+        type: "error",
         color: theme.palette.text.secondary,
-        status: `⦸ ${DisplayWorkspaceBuildStatusLanguage.failed}`,
+        status: DisplayWorkspaceBuildStatusLanguage.failed,
       }
     case "canceling":
       return {
+        type: "warning",
         color: theme.palette.warning.light,
-        status: `◍ ${DisplayWorkspaceBuildStatusLanguage.canceling}`,
+        status: DisplayWorkspaceBuildStatusLanguage.canceling,
       }
     case "canceled":
       return {
+        type: "secondary",
         color: theme.palette.text.secondary,
-        status: `◍ ${DisplayWorkspaceBuildStatusLanguage.canceled}`,
+        status: DisplayWorkspaceBuildStatusLanguage.canceled,
       }
   }
-}
-
-export const DisplayWorkspaceBuildInitiatedByLanguage = {
-  autostart: "system/autostart",
-  autostop: "system/autostop",
 }
 
 export const getDisplayWorkspaceBuildInitiatedBy = (
@@ -77,9 +79,8 @@ export const getDisplayWorkspaceBuildInitiatedBy = (
     case "initiator":
       return build.initiator_name
     case "autostart":
-      return DisplayWorkspaceBuildInitiatedByLanguage.autostart
     case "autostop":
-      return DisplayWorkspaceBuildInitiatedByLanguage.autostop
+      return "Coder"
   }
 }
 
@@ -105,57 +106,18 @@ export const displayWorkspaceBuildDuration = (
   return duration ? `${duration} seconds` : inProgressLabel
 }
 
-export const DisplayAgentStatusLanguage = {
-  loading: "Loading...",
-  connected: "⦿ Connected",
-  connecting: "⦿ Connecting",
-  disconnected: "◍ Disconnected",
-}
-
-export const getDisplayAgentStatus = (
-  theme: Theme,
-  agent: TypesGen.WorkspaceAgent,
-): {
-  color: string
-  status: string
-} => {
-  switch (agent.status) {
-    case undefined:
-      return {
-        color: theme.palette.text.secondary,
-        status: DisplayAgentStatusLanguage.loading,
-      }
-    case "connected":
-      return {
-        color: theme.palette.success.main,
-        status: DisplayAgentStatusLanguage["connected"],
-      }
-    case "connecting":
-      return {
-        color: theme.palette.primary.main,
-        status: DisplayAgentStatusLanguage["connecting"],
-      }
-    case "disconnected":
-      return {
-        color: theme.palette.text.secondary,
-        status: DisplayAgentStatusLanguage["disconnected"],
-      }
-  }
-}
-
 export const getDisplayVersionStatus = (
   agentVersion: string,
   serverVersion: string,
 ): { displayVersion: string; outdated: boolean } => {
   if (!semver.valid(serverVersion) || !semver.valid(agentVersion)) {
     return {
-      displayVersion:
-        `${agentVersion}` || `(${DisplayAgentVersionLanguage.unknown})`,
+      displayVersion: agentVersion || DisplayAgentVersionLanguage.unknown,
       outdated: false,
     }
   } else if (semver.lt(agentVersion, serverVersion)) {
     return {
-      displayVersion: `${agentVersion} (${DisplayAgentVersionLanguage.outdated})`,
+      displayVersion: agentVersion,
       outdated: true,
     }
   } else {
@@ -219,4 +181,12 @@ export const getFaviconByStatus = (
     case "pending":
       return "favicon"
   }
+}
+
+export const getDisplayWorkspaceTemplateName = (
+  workspace: TypesGen.Workspace,
+): string => {
+  return workspace.template_display_name.length > 0
+    ? workspace.template_display_name
+    : workspace.template_name
 }

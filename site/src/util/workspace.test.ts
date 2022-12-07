@@ -5,6 +5,7 @@ import {
   defaultWorkspaceExtension,
   getDisplayVersionStatus,
   getDisplayWorkspaceBuildInitiatedBy,
+  getDisplayWorkspaceTemplateName,
   isWorkspaceOn,
 } from "./workspace"
 
@@ -82,14 +83,14 @@ describe("util > workspace", () => {
           ...Mocks.MockWorkspaceBuild,
           reason: "autostart",
         },
-        "system/autostart",
+        "Coder",
       ],
       [
         {
           ...Mocks.MockWorkspaceBuild,
           reason: "autostop",
         },
-        "system/autostop",
+        "Coder",
       ],
     ])(
       `getDisplayWorkspaceBuildInitiatedBy(%p) returns %p`,
@@ -101,11 +102,11 @@ describe("util > workspace", () => {
 
   describe("getDisplayVersionStatus", () => {
     it.each<[string, string, string, boolean]>([
-      ["", "", "(unknown)", false],
-      ["", "v1.2.3", "(unknown)", false],
+      ["", "", "Unknown", false],
+      ["", "v1.2.3", "Unknown", false],
       ["v1.2.3", "", "v1.2.3", false],
       ["v1.2.3", "v1.2.3", "v1.2.3", false],
-      ["v1.2.3", "v1.2.4", "v1.2.3 (outdated)", true],
+      ["v1.2.3", "v1.2.4", "v1.2.3", true],
       ["v1.2.4", "v1.2.3", "v1.2.4", false],
       ["foo", "bar", "foo", false],
     ])(
@@ -119,5 +120,23 @@ describe("util > workspace", () => {
         expect(expectedOutdated).toEqual(outdated)
       },
     )
+  })
+
+  describe("getDisplayWorkspaceTemplateName", () => {
+    it("display name is not set", async () => {
+      const workspace: TypesGen.Workspace = {
+        ...Mocks.MockWorkspace,
+        template_display_name: "",
+      }
+      const displayed = getDisplayWorkspaceTemplateName(workspace)
+      expect(displayed).toEqual(workspace.template_name)
+    })
+    it("display name is set", async () => {
+      const workspace: TypesGen.Workspace = {
+        ...Mocks.MockWorkspace,
+      }
+      const displayed = getDisplayWorkspaceTemplateName(workspace)
+      expect(displayed).toEqual(workspace.template_display_name)
+    })
   })
 })

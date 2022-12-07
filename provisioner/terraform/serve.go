@@ -7,29 +7,10 @@ import (
 	"time"
 
 	"github.com/cli/safeexec"
-	"github.com/hashicorp/go-version"
-	"github.com/hashicorp/hc-install/product"
-	"github.com/hashicorp/hc-install/releases"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
 	"github.com/coder/coder/provisionersdk"
-)
-
-var (
-	// TerraformVersion is the version of Terraform used internally
-	// when Terraform is not available on the system.
-	TerraformVersion = version.Must(version.NewVersion("1.3.0"))
-
-	minTerraformVersion = version.Must(version.NewVersion("1.1.0"))
-	maxTerraformVersion = version.Must(version.NewVersion("1.3.0"))
-
-	terraformMinorVersionMismatch = xerrors.New("Terraform binary minor version mismatch.")
-
-	installTerraform         sync.Once
-	installTerraformExecPath string
-	// nolint:errname
-	installTerraformError error
 )
 
 const (
@@ -42,8 +23,9 @@ type ServeOptions struct {
 	// BinaryPath specifies the "terraform" binary to use.
 	// If omitted, the $PATH will attempt to find it.
 	BinaryPath string
-	CachePath  string
-	Logger     slog.Logger
+	// CachePath must not be used by multiple processes at once.
+	CachePath string
+	Logger    slog.Logger
 
 	// ExitTimeout defines how long we will wait for a running Terraform
 	// command to exit (cleanly) if the provision was stopped. This only
@@ -98,21 +80,11 @@ func Serve(ctx context.Context, options *ServeOptions) error {
 				return xerrors.Errorf("absolute binary context canceled: %w", err)
 			}
 
-			// We don't want to install Terraform multiple times!
-			installTerraform.Do(func() {
-				installer := &releases.ExactVersion{
-					InstallDir: options.CachePath,
-					Product:    product.Terraform,
-					Version:    TerraformVersion,
-				}
-				installer.SetLogger(slog.Stdlib(ctx, options.Logger, slog.LevelDebug))
-				options.Logger.Debug(ctx, "installing terraform", slog.F("dir", options.CachePath), slog.F("version", TerraformVersion))
-				installTerraformExecPath, installTerraformError = installer.Install(ctx)
-			})
-			if installTerraformError != nil {
-				return xerrors.Errorf("install terraform: %w", installTerraformError)
+			binPath, err := Install(ctx, options.Logger, options.CachePath, TerraformVersion)
+			if err != nil {
+				return xerrors.Errorf("install terraform: %w", err)
 			}
-			options.BinaryPath = installTerraformExecPath
+			options.BinaryPath = binPath
 		} else {
 			options.BinaryPath = absoluteBinary
 		}
@@ -121,6 +93,7 @@ func Serve(ctx context.Context, options *ServeOptions) error {
 		options.ExitTimeout = defaultExitTimeout
 	}
 	return provisionersdk.Serve(ctx, &server{
+		execMut:     &sync.Mutex{},
 		binaryPath:  options.BinaryPath,
 		cachePath:   options.CachePath,
 		logger:      options.Logger,
@@ -129,20 +102,16 @@ func Serve(ctx context.Context, options *ServeOptions) error {
 }
 
 type server struct {
-	// initMu protects against executors running `terraform init`
-	// concurrently when cache path is set.
-	initMu sync.Mutex
-
-	binaryPath string
-	cachePath  string
-	logger     slog.Logger
-
+	execMut     *sync.Mutex
+	binaryPath  string
+	cachePath   string
+	logger      slog.Logger
 	exitTimeout time.Duration
 }
 
-func (s *server) executor(workdir string) executor {
-	return executor{
-		initMu:     &s.initMu,
+func (s *server) executor(workdir string) *executor {
+	return &executor{
+		mut:        s.execMut,
 		binaryPath: s.binaryPath,
 		cachePath:  s.cachePath,
 		workdir:    workdir,

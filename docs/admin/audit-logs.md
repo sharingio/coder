@@ -11,8 +11,9 @@ We track **create, update and delete** events for the following resources:
 - Template
 - TemplateVersion
 - Workspace
-- APIKey
+- WorkspaceBuild
 - User
+- Group
 
 ## Filtering logs
 
@@ -29,7 +30,9 @@ The supported filters are:
 - `action`- The action applied to a resource. You can [find here](https://pkg.go.dev/github.com/coder/coder@main/codersdk#AuditAction) all the actions that are supported.
 - `username` - The username of the user who triggered the action.
 - `email` - The email of the user who triggered the action.
+- `date_from` - The inclusive start date with format `YYYY-MM-DD`.
+- `date_to ` - the inclusive end date with format `YYYY-MM-DD`.
 
 ## Enabling this feature
 
-This feature is only available with an enterprise license. [Learn more](./enterprise.md)
+This feature is only available with an enterprise license. [Learn more](../enterprise.md)

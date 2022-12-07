@@ -23,11 +23,27 @@ subdomain that resolves to Coder (e.g. `*.coder.example.com`).
 > If you are providing TLS certificates directly to the Coder server, you must use a single certificate for the
 > root and wildcard domains. Multi-certificate support [is planned](https://github.com/coder/coder/pull/4150).
 
+## TLS Certificates
+
+The Coder server can directly use TLS certificates with `CODER_TLS_ENABLE` and accompanying configuration flags. However, Coder can also run behind a reverse-proxy to terminate TLS certificates from LetsEncrypt, for example.
+
+- Example: [Run Coder with Caddy and LetsEncrypt](https://github.com/coder/coder/tree/main/examples/web-server/caddy)
+
 ## PostgreSQL Database
 
 Coder uses a PostgreSQL database to store users, workspace metadata, and other deployment information.
 Use `CODER_PG_CONNECTION_URL` to set the database that Coder connects to. If unset, PostgreSQL binaries will be
 downloaded from Maven (https://repo1.maven.org/maven2) and store all data in the config root.
+
+> Postgres 13 is the minimum supported version.
+
+If you are using the built-in PostgreSQL deployment and need to use `psql` (aka
+the PostgreSQL interactive terminal), output the connection URL with the following command:
+
+```sh
+$ coder server postgres-builtin-url
+$ psql "postgres://coder@localhost:49627/coder?sslmode=disable&password=feU...yI1"
+```
 
 ## System packages
 
@@ -73,7 +89,7 @@ journalctl -u coder.service -b
 To restart Coder after applying system changes:
 
 ```sh
-sudo systemctl restart Coder
+sudo systemctl restart coder
 ```
 
 ## Up Next

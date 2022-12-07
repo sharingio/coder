@@ -5,24 +5,20 @@ import { makeStyles } from "@material-ui/core/styles"
 import AddCircleOutline from "@material-ui/icons/AddCircleOutline"
 import SettingsOutlined from "@material-ui/icons/SettingsOutlined"
 import { useMachine, useSelector } from "@xstate/react"
-import { ChooseOne, Cond } from "components/Conditionals/ChooseOne"
-import { DeleteDialog } from "components/Dialogs/DeleteDialog/DeleteDialog"
-import { DeleteButton } from "components/DropdownButton/ActionCtas"
-import { DropdownButton } from "components/DropdownButton/DropdownButton"
-import { Loader } from "components/Loader/Loader"
 import {
   PageHeader,
   PageHeaderSubtitle,
   PageHeaderTitle,
 } from "components/PageHeader/PageHeader"
 import { useOrganizationId } from "hooks/useOrganizationId"
-import { createContext, FC, PropsWithChildren, useContext } from "react"
 import {
-  Link as RouterLink,
-  Navigate,
-  NavLink,
-  useParams,
-} from "react-router-dom"
+  createContext,
+  FC,
+  PropsWithChildren,
+  Suspense,
+  useContext,
+} from "react"
+import { Link as RouterLink, NavLink, useParams } from "react-router-dom"
 import { combineClasses } from "util/combineClasses"
 import { firstLetter } from "util/firstLetter"
 import { selectPermissions } from "xServices/auth/authSelectors"
@@ -31,9 +27,10 @@ import {
   TemplateContext,
   templateMachine,
 } from "xServices/template/templateXService"
-import { Margins } from "../../components/Margins/Margins"
-import { Stack } from "../../components/Stack/Stack"
+import { Margins } from "components/Margins/Margins"
+import { Stack } from "components/Stack/Stack"
 import { Permissions } from "xServices/auth/authXService"
+import { Loader } from "components/Loader/Loader"
 
 const Language = {
   settingsButton: "Settings",
@@ -53,7 +50,7 @@ const useTemplateName = () => {
 
 type TemplateLayoutContextValue = {
   context: TemplateContext
-  permissions: Permissions
+  permissions?: Permissions
 }
 
 const TemplateLayoutContext = createContext<
@@ -70,57 +67,64 @@ export const useTemplateLayoutContext = (): TemplateLayoutContextValue => {
   return context
 }
 
+const TemplateSettingsButton: FC<{ templateName: string }> = ({
+  templateName,
+}) => (
+  <Link
+    underline="none"
+    component={RouterLink}
+    to={`/templates/${templateName}/settings`}
+  >
+    <Button variant="outlined" startIcon={<SettingsOutlined />}>
+      {Language.settingsButton}
+    </Button>
+  </Link>
+)
+
+const CreateWorkspaceButton: FC<{
+  templateName: string
+  className?: string
+}> = ({ templateName, className }) => (
+  <Link
+    underline="none"
+    component={RouterLink}
+    to={`/templates/${templateName}/workspace`}
+  >
+    <Button className={className ?? ""} startIcon={<AddCircleOutline />}>
+      {Language.createButton}
+    </Button>
+  </Link>
+)
+
 export const TemplateLayout: FC<PropsWithChildren> = ({ children }) => {
   const styles = useStyles()
   const organizationId = useOrganizationId()
   const templateName = useTemplateName()
-  const [templateState, templateSend] = useMachine(templateMachine, {
+  const [templateState, _] = useMachine(templateMachine, {
     context: {
       templateName,
       organizationId,
     },
   })
-  const {
-    template,
-    activeTemplateVersion,
-    templateResources,
-    templateDAUs,
-    permissions: templatePermissions,
-  } = templateState.context
+  const { template, permissions: templatePermissions } = templateState.context
   const xServices = useContext(XServiceContext)
   const permissions = useSelector(xServices.authXService, selectPermissions)
-  const isLoading =
-    !template ||
-    !activeTemplateVersion ||
-    !templateResources ||
-    !permissions ||
-    !templateDAUs ||
-    !templatePermissions
+  const hasIcon = template && template.icon && template.icon !== ""
 
-  if (isLoading) {
+  if (!template) {
     return <Loader />
   }
 
-  if (templateState.matches("deleted")) {
-    return <Navigate to="/templates" />
-  }
+  const generatePageHeaderActions = (): JSX.Element[] => {
+    const pageActions: JSX.Element[] = []
 
-  const hasIcon = template.icon && template.icon !== ""
+    if (templatePermissions?.canUpdateTemplate) {
+      pageActions.push(<TemplateSettingsButton templateName={template.name} />)
+    }
 
-  const createWorkspaceButton = (className?: string) => (
-    <Link
-      underline="none"
-      component={RouterLink}
-      to={`/templates/${template.name}/workspace`}
-    >
-      <Button className={className ?? ""} startIcon={<AddCircleOutline />}>
-        {Language.createButton}
-      </Button>
-    </Link>
-  )
+    pageActions.push(<CreateWorkspaceButton templateName={template.name} />)
 
-  const handleDeleteTemplate = () => {
-    templateSend("DELETE")
+    return pageActions
   }
 
   return (
@@ -128,34 +132,11 @@ export const TemplateLayout: FC<PropsWithChildren> = ({ children }) => {
       <Margins>
         <PageHeader
           actions={
-            <ChooseOne>
-              <Cond condition={templatePermissions.canUpdateTemplate}>
-                <Link
-                  underline="none"
-                  component={RouterLink}
-                  to={`/templates/${template.name}/settings`}
-                >
-                  <Button variant="outlined" startIcon={<SettingsOutlined />}>
-                    {Language.settingsButton}
-                  </Button>
-                </Link>
-
-                <DropdownButton
-                  primaryAction={createWorkspaceButton(styles.actionButton)}
-                  secondaryActions={[
-                    {
-                      action: "delete",
-                      button: (
-                        <DeleteButton handleAction={handleDeleteTemplate} />
-                      ),
-                    },
-                  ]}
-                  canCancel={false}
-                />
-              </Cond>
-
-              <Cond>{createWorkspaceButton()}</Cond>
-            </ChooseOne>
+            <>
+              {generatePageHeaderActions().map((action, i) => (
+                <div key={i}>{action}</div>
+              ))}
+            </>
           }
         >
           <Stack direction="row" spacing={3} className={styles.pageTitle}>
@@ -171,7 +152,11 @@ export const TemplateLayout: FC<PropsWithChildren> = ({ children }) => {
               )}
             </div>
             <div>
-              <PageHeaderTitle>{template.name}</PageHeaderTitle>
+              <PageHeaderTitle>
+                {template.display_name.length > 0
+                  ? template.display_name
+                  : template.name}
+              </PageHeaderTitle>
               <PageHeaderSubtitle condensed>
                 {template.description === ""
                   ? Language.noDescription
@@ -216,32 +201,15 @@ export const TemplateLayout: FC<PropsWithChildren> = ({ children }) => {
         <TemplateLayoutContext.Provider
           value={{ permissions, context: templateState.context }}
         >
-          {children}
+          <Suspense fallback={<Loader />}>{children}</Suspense>
         </TemplateLayoutContext.Provider>
       </Margins>
-
-      <DeleteDialog
-        isOpen={templateState.matches("confirmingDelete")}
-        confirmLoading={templateState.matches("deleting")}
-        onConfirm={() => {
-          templateSend("CONFIRM_DELETE")
-        }}
-        onCancel={() => {
-          templateSend("CANCEL_DELETE")
-        }}
-        entity="template"
-        name={template.name}
-      />
     </>
   )
 }
 
 export const useStyles = makeStyles((theme) => {
   return {
-    actionButton: {
-      border: "none",
-      borderRadius: `${theme.shape.borderRadius}px 0px 0px ${theme.shape.borderRadius}px`,
-    },
     pageTitle: {
       alignItems: "center",
     },

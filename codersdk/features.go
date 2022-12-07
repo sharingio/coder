@@ -15,12 +15,15 @@ const (
 )
 
 const (
-	FeatureUserLimit      = "user_limit"
-	FeatureAuditLog       = "audit_log"
-	FeatureBrowserOnly    = "browser_only"
-	FeatureSCIM           = "scim"
-	FeatureWorkspaceQuota = "workspace_quota"
-	FeatureTemplateRBAC   = "template_rbac"
+	FeatureUserLimit                  = "user_limit"
+	FeatureAuditLog                   = "audit_log"
+	FeatureBrowserOnly                = "browser_only"
+	FeatureSCIM                       = "scim"
+	FeatureTemplateRBAC               = "template_rbac"
+	FeatureHighAvailability           = "high_availability"
+	FeatureMultipleGitAuth            = "multiple_git_auth"
+	FeatureExternalProvisionerDaemons = "external_provisioner_daemons"
+	FeatureServiceBanners             = "service_banners"
 )
 
 var FeatureNames = []string{
@@ -28,8 +31,11 @@ var FeatureNames = []string{
 	FeatureAuditLog,
 	FeatureBrowserOnly,
 	FeatureSCIM,
-	FeatureWorkspaceQuota,
 	FeatureTemplateRBAC,
+	FeatureHighAvailability,
+	FeatureMultipleGitAuth,
+	FeatureExternalProvisionerDaemons,
+	FeatureServiceBanners,
 }
 
 type Feature struct {
@@ -42,6 +48,7 @@ type Feature struct {
 type Entitlements struct {
 	Features     map[string]Feature `json:"features"`
 	Warnings     []string           `json:"warnings"`
+	Errors       []string           `json:"errors"`
 	HasLicense   bool               `json:"has_license"`
 	Experimental bool               `json:"experimental"`
 	Trial        bool               `json:"trial"`

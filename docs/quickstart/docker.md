@@ -13,45 +13,69 @@ Coder with Docker has the following advantages:
 
 ## Instructions
 
-1.  [Install and launch Coder](../install)
+1. Run Coder with Docker.
 
-    The Coder server binds to port 3000 by default. Use `--address :<port>` to customize it!
+   ```shell
+   export CODER_DATA=$HOME/.config/coderv2-docker
+   export DOCKER_GROUP=$(getent group docker | cut -d: -f3)
+   mkdir -p $CODER_DATA
+   docker run --rm -it \
+       -v $CODER_DATA:/home/coder/.config \
+       -v /var/run/docker.sock:/var/run/docker.sock \
+       --group-add $DOCKER_GROUP \
+       ghcr.io/coder/coder:latest
+   ```
 
-    ```bash
-    $ coder server
-    ```
+   > This will use Coder's tunnel and built-in database. See our [Docker documentation](../install/docker.md) for other configuration options such as running on localhost, using docker-compose, and external PostgreSQL.
 
-1.  Run `coder login http://localhost:3000` in a new terminal and follow the
-    interactive instructions to create your user.
+1. In new terminal, [install Coder](../install/) in order to connect to your deployment through the CLI.
 
-1.  Pull the "Docker" example template using the interactive `coder templates init`:
+   ```shell
+   curl -L https://coder.com/install.sh | sh
+   ```
 
-    ```bash
-    $ coder templates init
-    $ cd docker
-    ```
+1. Run `coder login <access url>` and follow the
+   interactive instructions to create your user.
 
-1.  Push up the template with `coder templates create`
-1.  Open the dashboard in your browser (http://localhost:3000) to create your
-    first workspace:
+1. Pull the "Docker" example template using the interactive `coder templates init`:
 
-    <img src="../images/quickstart/docker/login.png">
+   ```shell
+   coder templates init
+   cd docker
+   ```
 
-    Then navigate to `Templates > docker > Create workspace`
+1. Push up the template with `coder templates create`
 
-    <img src="../images/quickstart/docker/create-workspace.png">
+1. Open the dashboard in your browser to create your
+   first workspace:
 
-    Now wait a few moments for the workspace to build... After the first build,
-    the image is cached and subsequent builds will take a few seconds.
+   <img src="../images/quickstart/docker/login.png">
 
-1.  Your workspace is ready to go!
+   Then navigate to `Templates > docker > Create workspace`
 
-    <img src="../images/quickstart/docker/ides.png">
+   <img src="../images/quickstart/docker/create-workspace.png">
 
-    Open up a web application or [SSH in](../ides.md#ssh-configuration).
+   Now wait a few moments for the workspace to build... After the first build,
+   the image is cached and subsequent builds will take a few seconds.
 
-1.  If you want to modify the Docker image or template, edit the files in the
-    previously created `./docker` directory, then run `coder templates push`.
+1. Your workspace is ready to go!
+
+   <img src="../images/quickstart/docker/ides.png">
+
+   Open up a web application or [SSH in](../ides.md#ssh-configuration).
+
+1. If you want to modify the Docker image or template, edit the files in the
+   previously created `./docker` directory, then run `coder templates push`.
+
+## Troubleshooting
+
+### Docker-based workspace is stuck in "Connecting..."
+
+Ensure you have an externally-reachable `CODER_ACCESS_URL` set. See [troubleshooting templates](../templates.md#creating-and-troubleshooting-templates) for more steps.
+
+### Permission denied while trying to connect to the Docker daemon socket
+
+See Docker's official documentation to [Manage Docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user).
 
 ## Next Steps
 

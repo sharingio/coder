@@ -9,6 +9,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/coderd"
+	"github.com/coder/coder/coderd/audit"
 	"github.com/coder/coder/coderd/database"
 	"github.com/coder/coder/coderd/httpapi"
 	"github.com/coder/coder/coderd/httpmw"
@@ -18,11 +19,19 @@ import (
 
 func (api *API) postGroupByOrganization(rw http.ResponseWriter, r *http.Request) {
 	var (
-		ctx = r.Context()
-		org = httpmw.OrganizationParam(r)
+		ctx               = r.Context()
+		org               = httpmw.OrganizationParam(r)
+		auditor           = api.AGPL.Auditor.Load()
+		aReq, commitAudit = audit.InitRequest[database.Group](rw, &audit.RequestParams{
+			Audit:   *auditor,
+			Log:     api.Logger,
+			Request: r,
+			Action:  database.AuditActionCreate,
+		})
 	)
+	defer commitAudit()
 
-	if !api.Authorize(r, rbac.ActionCreate, rbac.ResourceGroup) {
+	if !api.Authorize(r, rbac.ActionCreate, rbac.ResourceGroup.InOrg(org.ID)) {
 		http.NotFound(rw, r)
 		return
 	}
@@ -43,6 +52,8 @@ func (api *API) postGroupByOrganization(rw http.ResponseWriter, r *http.Request)
 		ID:             uuid.New(),
 		Name:           req.Name,
 		OrganizationID: org.ID,
+		AvatarURL:      req.AvatarURL,
+		QuotaAllowance: int32(req.QuotaAllowance),
 	})
 	if database.IsUniqueViolation(err) {
 		httpapi.Write(ctx, rw, http.StatusConflict, codersdk.Response{
@@ -54,15 +65,25 @@ func (api *API) postGroupByOrganization(rw http.ResponseWriter, r *http.Request)
 		httpapi.InternalServerError(rw, err)
 		return
 	}
+	aReq.New = group
 
 	httpapi.Write(ctx, rw, http.StatusCreated, convertGroup(group, nil))
 }
 
 func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 	var (
-		ctx   = r.Context()
-		group = httpmw.GroupParam(r)
+		ctx               = r.Context()
+		group             = httpmw.GroupParam(r)
+		auditor           = api.AGPL.Auditor.Load()
+		aReq, commitAudit = audit.InitRequest[database.Group](rw, &audit.RequestParams{
+			Audit:   *auditor,
+			Log:     api.Logger,
+			Request: r,
+			Action:  database.AuditActionWrite,
+		})
 	)
+	defer commitAudit()
+	aReq.Old = group
 
 	if !api.Authorize(r, rbac.ActionUpdate, group) {
 		http.NotFound(rw, r)
@@ -79,6 +100,12 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 			Message: fmt.Sprintf("%q is a reserved group name!", database.AllUsersGroup),
 		})
 		return
+	}
+
+	// If the name matches the existing group name pretend we aren't
+	// updating the name at all.
+	if req.Name == group.Name {
+		req.Name = ""
 	}
 
 	users := make([]string, 0, len(req.AddUsers)+len(req.RemoveUsers))
@@ -109,7 +136,7 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.Name != "" {
+	if req.Name != "" && req.Name != group.Name {
 		_, err := api.Database.GetGroupByOrgAndName(ctx, database.GetGroupByOrgAndNameParams{
 			OrganizationID: group.OrganizationID,
 			Name:           req.Name,
@@ -123,16 +150,35 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	err := api.Database.InTx(func(tx database.Store) error {
-		if req.Name != "" {
-			var err error
-			group, err = tx.UpdateGroupByID(ctx, database.UpdateGroupByIDParams{
-				ID:   group.ID,
-				Name: req.Name,
-			})
-			if err != nil {
-				return xerrors.Errorf("update group by ID: %w", err)
-			}
+		var err error
+		group, err = tx.GetGroupByID(ctx, group.ID)
+		if err != nil {
+			return xerrors.Errorf("get group by ID: %w", err)
 		}
+
+		updateGroupParams := database.UpdateGroupByIDParams{
+			ID:             group.ID,
+			AvatarURL:      group.AvatarURL,
+			Name:           group.Name,
+			QuotaAllowance: group.QuotaAllowance,
+		}
+
+		// TODO: Do we care about validating this?
+		if req.AvatarURL != nil {
+			updateGroupParams.AvatarURL = *req.AvatarURL
+		}
+		if req.Name != "" {
+			updateGroupParams.Name = req.Name
+		}
+		if req.QuotaAllowance != nil {
+			updateGroupParams.QuotaAllowance = int32(*req.QuotaAllowance)
+		}
+
+		group, err = tx.UpdateGroupByID(ctx, updateGroupParams)
+		if err != nil {
+			return xerrors.Errorf("update group by ID: %w", err)
+		}
+
 		for _, id := range req.AddUsers {
 			err := tx.InsertGroupMember(ctx, database.InsertGroupMemberParams{
 				GroupID: group.ID,
@@ -149,7 +195,7 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 			}
 		}
 		return nil
-	})
+	}, nil)
 	if database.IsUniqueViolation(err) {
 		httpapi.Write(ctx, rw, http.StatusPreconditionFailed, codersdk.Response{
 			Message: "Cannot add the same user to a group twice!",
@@ -175,14 +221,25 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	aReq.New = group
+
 	httpapi.Write(ctx, rw, http.StatusOK, convertGroup(group, members))
 }
 
 func (api *API) deleteGroup(rw http.ResponseWriter, r *http.Request) {
 	var (
-		ctx   = r.Context()
-		group = httpmw.GroupParam(r)
+		ctx               = r.Context()
+		group             = httpmw.GroupParam(r)
+		auditor           = api.AGPL.Auditor.Load()
+		aReq, commitAudit = audit.InitRequest[database.Group](rw, &audit.RequestParams{
+			Audit:   *auditor,
+			Log:     api.Logger,
+			Request: r,
+			Action:  database.AuditActionDelete,
+		})
 	)
+	defer commitAudit()
+	aReq.Old = group
 
 	if !api.Authorize(r, rbac.ActionDelete, group) {
 		httpapi.ResourceNotFound(rw)
@@ -276,6 +333,8 @@ func convertGroup(g database.Group, users []database.User) codersdk.Group {
 		ID:             g.ID,
 		Name:           g.Name,
 		OrganizationID: g.OrganizationID,
+		AvatarURL:      g.AvatarURL,
+		QuotaAllowance: int(g.QuotaAllowance),
 		Members:        convertUsers(users, orgs),
 	}
 }

@@ -2,18 +2,18 @@ package cli_test
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"cdr.dev/slog"
 
 	"github.com/coder/coder/cli/clitest"
 	"github.com/coder/coder/coderd/coderdtest"
 	"github.com/coder/coder/provisioner/echo"
 	"github.com/coder/coder/provisionersdk/proto"
-	"github.com/coder/coder/testutil"
 )
 
 func TestWorkspaceAgent(t *testing.T) {
@@ -29,7 +29,7 @@ func TestWorkspaceAgent(t *testing.T) {
 		user := coderdtest.CreateFirstUser(t, client)
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, &echo.Responses{
 			Parse: echo.ParseComplete,
-			Provision: []*proto.Provision_Response{{
+			ProvisionApply: []*proto.Provision_Response{{
 				Type: &proto.Provision_Response_Complete{
 					Complete: &proto.Provision_Complete{
 						Resources: []*proto.Resource{{
@@ -67,13 +67,10 @@ func TestWorkspaceAgent(t *testing.T) {
 		if assert.NotEmpty(t, workspace.LatestBuild.Resources) && assert.NotEmpty(t, resources[0].Agents) {
 			assert.NotEmpty(t, resources[0].Agents[0].Version)
 		}
-		dialer, err := client.DialWorkspaceAgentTailnet(ctx, slog.Logger{}, resources[0].Agents[0].ID)
+		dialer, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID, nil)
 		require.NoError(t, err)
 		defer dialer.Close()
-		require.Eventually(t, func() bool {
-			_, err := dialer.Ping()
-			return err == nil
-		}, testutil.WaitMedium, testutil.IntervalFast)
+		require.True(t, dialer.AwaitReachable(context.Background()))
 		cancelFunc()
 		err = <-errC
 		require.NoError(t, err)
@@ -90,7 +87,7 @@ func TestWorkspaceAgent(t *testing.T) {
 		user := coderdtest.CreateFirstUser(t, client)
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, &echo.Responses{
 			Parse: echo.ParseComplete,
-			Provision: []*proto.Provision_Response{{
+			ProvisionApply: []*proto.Provision_Response{{
 				Type: &proto.Provision_Response_Complete{
 					Complete: &proto.Provision_Complete{
 						Resources: []*proto.Resource{{
@@ -128,13 +125,10 @@ func TestWorkspaceAgent(t *testing.T) {
 		if assert.NotEmpty(t, resources) && assert.NotEmpty(t, resources[0].Agents) {
 			assert.NotEmpty(t, resources[0].Agents[0].Version)
 		}
-		dialer, err := client.DialWorkspaceAgentTailnet(ctx, slog.Logger{}, resources[0].Agents[0].ID)
+		dialer, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID, nil)
 		require.NoError(t, err)
 		defer dialer.Close()
-		require.Eventually(t, func() bool {
-			_, err := dialer.Ping()
-			return err == nil
-		}, testutil.WaitMedium, testutil.IntervalFast)
+		require.True(t, dialer.AwaitReachable(context.Background()))
 		cancelFunc()
 		err = <-errC
 		require.NoError(t, err)
@@ -151,7 +145,7 @@ func TestWorkspaceAgent(t *testing.T) {
 		user := coderdtest.CreateFirstUser(t, client)
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, &echo.Responses{
 			Parse: echo.ParseComplete,
-			Provision: []*proto.Provision_Response{{
+			ProvisionApply: []*proto.Provision_Response{{
 				Type: &proto.Provision_Response_Complete{
 					Complete: &proto.Provision_Complete{
 						Resources: []*proto.Resource{{
@@ -189,13 +183,26 @@ func TestWorkspaceAgent(t *testing.T) {
 		if assert.NotEmpty(t, resources) && assert.NotEmpty(t, resources[0].Agents) {
 			assert.NotEmpty(t, resources[0].Agents[0].Version)
 		}
-		dialer, err := client.DialWorkspaceAgentTailnet(ctx, slog.Logger{}, resources[0].Agents[0].ID)
+		dialer, err := client.DialWorkspaceAgent(ctx, resources[0].Agents[0].ID, nil)
 		require.NoError(t, err)
 		defer dialer.Close()
-		require.Eventually(t, func() bool {
-			_, err := dialer.Ping()
-			return err == nil
-		}, testutil.WaitMedium, testutil.IntervalFast)
+		require.True(t, dialer.AwaitReachable(context.Background()))
+		sshClient, err := dialer.SSHClient(ctx)
+		require.NoError(t, err)
+		defer sshClient.Close()
+		session, err := sshClient.NewSession()
+		require.NoError(t, err)
+		defer session.Close()
+		key := "CODER_AGENT_TOKEN"
+		command := "sh -c 'echo $" + key + "'"
+		if runtime.GOOS == "windows" {
+			command = "cmd.exe /c echo %" + key + "%"
+		}
+		token, err := session.CombinedOutput(command)
+		require.NoError(t, err)
+		_, err = uuid.Parse(strings.TrimSpace(string(token)))
+		require.NoError(t, err)
+
 		cancelFunc()
 		err = <-errC
 		require.NoError(t, err)

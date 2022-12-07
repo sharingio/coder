@@ -11,15 +11,18 @@ import useTheme from "@material-ui/styles/useTheme"
 import { AlertBanner } from "components/AlertBanner/AlertBanner"
 import { ChooseOne, Cond } from "components/Conditionals/ChooseOne"
 import { Maybe } from "components/Conditionals/Maybe"
+import { TableEmpty } from "components/TableEmpty/TableEmpty"
 import { FC } from "react"
 import { useTranslation } from "react-i18next"
 import { useNavigate } from "react-router-dom"
 import { createDayString } from "util/createDayString"
-import { formatTemplateActiveDevelopers } from "util/templates"
+import {
+  formatTemplateBuildTime,
+  formatTemplateActiveDevelopers,
+} from "util/templates"
 import * as TypesGen from "../../api/typesGenerated"
 import { AvatarData } from "../../components/AvatarData/AvatarData"
 import { CodeExample } from "../../components/CodeExample/CodeExample"
-import { EmptyState } from "../../components/EmptyState/EmptyState"
 import { Margins } from "../../components/Margins/Margins"
 import {
   PageHeader,
@@ -44,6 +47,7 @@ export const Language = {
     }`
   },
   nameLabel: "Name",
+  buildTimeLabel: "Build time",
   usedByLabel: "Used by",
   lastUpdatedLabel: "Last updated",
   emptyViewNoPerms:
@@ -155,8 +159,9 @@ export const TemplatesPageView: FC<
             <Table>
               <TableHead>
                 <TableRow>
-                  <TableCell width="50%">{Language.nameLabel}</TableCell>
+                  <TableCell width="34%">{Language.nameLabel}</TableCell>
                   <TableCell width="16%">{Language.usedByLabel}</TableCell>
+                  <TableCell width="16%">{Language.buildTimeLabel}</TableCell>
                   <TableCell width="16%">{Language.lastUpdatedLabel}</TableCell>
                   <TableCell width="16%">{Language.createdByLabel}</TableCell>
                   <TableCell width="1%"></TableCell>
@@ -169,20 +174,21 @@ export const TemplatesPageView: FC<
 
                 <ChooseOne>
                   <Cond condition={empty}>
-                    <TableRow>
-                      <TableCell colSpan={999}>
-                        <EmptyState
-                          message={Language.emptyMessage}
-                          description={
-                            props.canCreateTemplate
-                              ? Language.emptyDescription
-                              : Language.emptyViewNoPerms
-                          }
-                          descriptionClassName={styles.emptyDescription}
-                          cta={<CodeExample code="coder templates init" />}
-                        />
-                      </TableCell>
-                    </TableRow>
+                    <TableEmpty
+                      className={styles.empty}
+                      message={Language.emptyMessage}
+                      description={
+                        props.canCreateTemplate
+                          ? Language.emptyDescription
+                          : Language.emptyViewNoPerms
+                      }
+                      cta={<CodeExample code="coder templates init" />}
+                      image={
+                        <div className={styles.emptyImage}>
+                          <img src="/featured/templates.webp" alt="" />
+                        </div>
+                      }
+                    />
                   </Cond>
                   <Cond>
                     {props.templates?.map((template) => {
@@ -204,7 +210,11 @@ export const TemplatesPageView: FC<
                         >
                           <TableCellLink to={templatePageLink}>
                             <AvatarData
-                              title={template.name}
+                              title={
+                                template.display_name.length > 0
+                                  ? template.display_name
+                                  : template.name
+                              }
                               subtitle={template.description}
                               highlightTitle
                               avatar={
@@ -223,6 +233,16 @@ export const TemplatesPageView: FC<
                             >
                               {Language.developerCount(
                                 template.active_user_count,
+                              )}
+                            </span>
+                          </TableCellLink>
+
+                          <TableCellLink to={templatePageLink}>
+                            <span
+                              style={{ color: theme.palette.text.secondary }}
+                            >
+                              {formatTemplateBuildTime(
+                                template.build_time_stats.start.P50,
                               )}
                             </span>
                           </TableCellLink>
@@ -268,9 +288,6 @@ export const TemplatesPageView: FC<
 }
 
 const useStyles = makeStyles((theme) => ({
-  emptyDescription: {
-    maxWidth: theme.spacing(62),
-  },
   clickableTableRow: {
     "&:hover td": {
       backgroundColor: theme.palette.action.hover,
@@ -300,6 +317,20 @@ const useStyles = makeStyles((theme) => ({
 
     "& img": {
       width: "100%",
+    },
+  },
+  empty: {
+    paddingBottom: 0,
+  },
+
+  emptyImage: {
+    maxWidth: "50%",
+    height: theme.spacing(40),
+    overflow: "hidden",
+    opacity: 0.85,
+
+    "& img": {
+      maxWidth: "100%",
     },
   },
 }))

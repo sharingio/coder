@@ -46,7 +46,9 @@ export type WorkspaceScheduleEvent =
   | {
       type: "SUBMIT_SCHEDULE"
       autoStart: TypesGen.UpdateWorkspaceAutostartRequest
+      autoStartChanged: boolean
       ttl: TypesGen.UpdateWorkspaceTTLRequest
+      autoStopChanged: boolean
     }
 
 export const workspaceSchedule = createMachine(
@@ -195,11 +197,12 @@ export const workspaceSchedule = createMachine(
           throw new Error("Failed to load workspace.")
         }
 
-        // REMARK: These calls are purposefully synchronous because if one
-        //         value contradicts the other, we don't want a race condition
-        //         on re-submission.
-        await API.putWorkspaceAutostart(context.workspace.id, event.autoStart)
-        await API.putWorkspaceAutostop(context.workspace.id, event.ttl)
+        if (event.autoStartChanged) {
+          await API.putWorkspaceAutostart(context.workspace.id, event.autoStart)
+        }
+        if (event.autoStopChanged) {
+          await API.putWorkspaceAutostop(context.workspace.id, event.ttl)
+        }
       },
     },
   },

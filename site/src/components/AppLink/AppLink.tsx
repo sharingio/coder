@@ -3,11 +3,12 @@ import CircularProgress from "@material-ui/core/CircularProgress"
 import Link from "@material-ui/core/Link"
 import { makeStyles } from "@material-ui/core/styles"
 import Tooltip from "@material-ui/core/Tooltip"
-import ComputerIcon from "@material-ui/icons/Computer"
 import ErrorOutlineIcon from "@material-ui/icons/ErrorOutline"
-import { FC, PropsWithChildren } from "react"
+import { FC } from "react"
 import * as TypesGen from "../../api/typesGenerated"
 import { generateRandomString } from "../../util/random"
+import { BaseIcon } from "./BaseIcon"
+import { ShareIcon } from "./ShareIcon"
 
 export const Language = {
   appTitle: (appName: string, identifier: string): string =>
@@ -16,80 +17,79 @@ export const Language = {
 
 export interface AppLinkProps {
   appsHost?: string
-  username: TypesGen.User["username"]
-  workspaceName: TypesGen.Workspace["name"]
-  agentName: TypesGen.WorkspaceAgent["name"]
-  appName: TypesGen.WorkspaceApp["name"]
-  appIcon?: TypesGen.WorkspaceApp["icon"]
-  appCommand?: TypesGen.WorkspaceApp["command"]
-  appSubdomain: TypesGen.WorkspaceApp["subdomain"]
-  health: TypesGen.WorkspaceApp["health"]
+  workspace: TypesGen.Workspace
+  app: TypesGen.WorkspaceApp
+  agent: TypesGen.WorkspaceAgent
 }
 
-export const AppLink: FC<PropsWithChildren<AppLinkProps>> = ({
+export const AppLink: FC<AppLinkProps> = ({
   appsHost,
-  username,
-  workspaceName,
-  agentName,
-  appName,
-  appIcon,
-  appCommand,
-  appSubdomain,
-  health,
+  app,
+  workspace,
+  agent,
 }) => {
   const styles = useStyles()
+  const username = workspace.owner_name
+
+  let appSlug = app.slug
+  let appDisplayName = app.display_name
+  if (!appSlug) {
+    appSlug = appDisplayName
+  }
+  if (!appDisplayName) {
+    appDisplayName = appSlug
+  }
 
   // The backend redirects if the trailing slash isn't included, so we add it
   // here to avoid extra roundtrips.
-  let href = `/@${username}/${workspaceName}.${agentName}/apps/${encodeURIComponent(
-    appName,
-  )}/`
-  if (appCommand) {
-    href = `/@${username}/${workspaceName}.${agentName}/terminal?command=${encodeURIComponent(
-      appCommand,
-    )}`
+  let href = `/@${username}/${workspace.name}.${
+    agent.name
+  }/apps/${encodeURIComponent(appSlug)}/`
+  if (app.command) {
+    href = `/@${username}/${workspace.name}.${
+      agent.name
+    }/terminal?command=${encodeURIComponent(app.command)}`
   }
-  if (appsHost && appSubdomain) {
-    const subdomain = `${appName}--${agentName}--${workspaceName}--${username}`
-    href = `${window.location.protocol}//${subdomain}.${appsHost}/`
+  if (appsHost && app.subdomain) {
+    const subdomain = `${appSlug}--${agent.name}--${workspace.name}--${username}`
+    href = `${window.location.protocol}//${appsHost}/`.replace("*", subdomain)
   }
 
   let canClick = true
-  let icon = appIcon ? (
-    <img alt={`${appName} Icon`} src={appIcon} />
-  ) : (
-    <ComputerIcon />
-  )
-  let tooltip = ""
-  if (health === "initializing") {
+  let icon = <BaseIcon app={app} />
+
+  let primaryTooltip = ""
+  if (app.health === "initializing") {
     canClick = false
-    icon = <CircularProgress size={16} />
-    tooltip = "Initializing..."
+    icon = <CircularProgress size={12} />
+    primaryTooltip = "Initializing..."
   }
-  if (health === "unhealthy") {
+  if (app.health === "unhealthy") {
     canClick = false
     icon = <ErrorOutlineIcon className={styles.unhealthyIcon} />
-    tooltip = "Unhealthy"
+    primaryTooltip = "Unhealthy"
   }
-  if (!appsHost && appSubdomain) {
+  if (!appsHost && app.subdomain) {
     canClick = false
     icon = <ErrorOutlineIcon className={styles.notConfiguredIcon} />
-    tooltip = "Your admin has not configured subdomain application access"
+    primaryTooltip =
+      "Your admin has not configured subdomain application access"
   }
 
   const button = (
     <Button
       size="small"
       startIcon={icon}
+      endIcon={<ShareIcon app={app} />}
       className={styles.button}
       disabled={!canClick}
     >
-      {appName}
+      <span className={styles.appName}>{appDisplayName}</span>
     </Button>
   )
 
   return (
-    <Tooltip title={tooltip}>
+    <Tooltip title={primaryTooltip}>
       <span>
         <Link
           href={href}
@@ -101,7 +101,7 @@ export const AppLink: FC<PropsWithChildren<AppLinkProps>> = ({
                   event.preventDefault()
                   window.open(
                     href,
-                    Language.appTitle(appName, generateRandomString(12)),
+                    Language.appTitle(appDisplayName, generateRandomString(12)),
                     "width=900,height=600",
                   )
                 }
@@ -135,5 +135,9 @@ const useStyles = makeStyles((theme) => ({
 
   notConfiguredIcon: {
     color: theme.palette.grey[300],
+  },
+
+  appName: {
+    marginRight: theme.spacing(1),
   },
 }))

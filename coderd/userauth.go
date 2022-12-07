@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/go-github/v43/github"
 	"github.com/google/uuid"
+	"github.com/moby/moby/pkg/namesgenerator"
 	"golang.org/x/oauth2"
 	"golang.org/x/xerrors"
 
@@ -36,6 +38,7 @@ type GithubOAuth2Config struct {
 	TeamMembership              func(ctx context.Context, client *http.Client, org, team, username string) (*github.Membership, error)
 
 	AllowSignups       bool
+	AllowEveryone      bool
 	AllowOrganizations []string
 	AllowTeams         []GithubOAuth2Team
 }
@@ -55,32 +58,38 @@ func (api *API) userOAuth2Github(rw http.ResponseWriter, r *http.Request) {
 	)
 
 	oauthClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(state.Token))
-	memberships, err := api.GithubOAuth2Config.ListOrganizationMemberships(ctx, oauthClient)
-	if err != nil {
-		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching authenticated Github user organizations.",
-			Detail:  err.Error(),
-		})
-		return
-	}
-	var selectedMembership *github.Membership
-	for _, membership := range memberships {
-		if membership.GetState() != "active" {
-			continue
+
+	var selectedMemberships []*github.Membership
+	var organizationNames []string
+	if !api.GithubOAuth2Config.AllowEveryone {
+		memberships, err := api.GithubOAuth2Config.ListOrganizationMemberships(ctx, oauthClient)
+		if err != nil {
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error fetching authenticated Github user organizations.",
+				Detail:  err.Error(),
+			})
+			return
 		}
-		for _, allowed := range api.GithubOAuth2Config.AllowOrganizations {
-			if *membership.Organization.Login != allowed {
+
+		for _, membership := range memberships {
+			if membership.GetState() != "active" {
 				continue
 			}
-			selectedMembership = membership
-			break
+			for _, allowed := range api.GithubOAuth2Config.AllowOrganizations {
+				if *membership.Organization.Login != allowed {
+					continue
+				}
+				selectedMemberships = append(selectedMemberships, membership)
+				organizationNames = append(organizationNames, membership.Organization.GetLogin())
+				break
+			}
 		}
-	}
-	if selectedMembership == nil {
-		httpapi.Write(ctx, rw, http.StatusUnauthorized, codersdk.Response{
-			Message: "You aren't a member of the authorized Github organizations!",
-		})
-		return
+		if len(selectedMemberships) == 0 {
+			httpapi.Write(ctx, rw, http.StatusUnauthorized, codersdk.Response{
+				Message: "You aren't a member of the authorized Github organizations!",
+			})
+			return
+		}
 	}
 
 	ghUser, err := api.GithubOAuth2Config.AuthenticatedUser(ctx, oauthClient)
@@ -93,24 +102,29 @@ func (api *API) userOAuth2Github(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	// The default if no teams are specified is to allow all.
-	if len(api.GithubOAuth2Config.AllowTeams) > 0 {
+	if !api.GithubOAuth2Config.AllowEveryone && len(api.GithubOAuth2Config.AllowTeams) > 0 {
 		var allowedTeam *github.Membership
 		for _, allowTeam := range api.GithubOAuth2Config.AllowTeams {
-			if allowTeam.Organization != *selectedMembership.Organization.Login {
-				// This needs to continue because multiple organizations
-				// could exist in the allow/team listings.
-				continue
+			if allowedTeam != nil {
+				break
 			}
+			for _, selectedMembership := range selectedMemberships {
+				if allowTeam.Organization != *selectedMembership.Organization.Login {
+					// This needs to continue because multiple organizations
+					// could exist in the allow/team listings.
+					continue
+				}
 
-			allowedTeam, err = api.GithubOAuth2Config.TeamMembership(ctx, oauthClient, allowTeam.Organization, allowTeam.Slug, *ghUser.Login)
-			// The calling user may not have permission to the requested team!
-			if err != nil {
-				continue
+				allowedTeam, err = api.GithubOAuth2Config.TeamMembership(ctx, oauthClient, allowTeam.Organization, allowTeam.Slug, *ghUser.Login)
+				// The calling user may not have permission to the requested team!
+				if err != nil {
+					continue
+				}
 			}
 		}
 		if allowedTeam == nil {
 			httpapi.Write(ctx, rw, http.StatusUnauthorized, codersdk.Response{
-				Message: fmt.Sprintf("You aren't a member of an authorized team in the %s Github organization!", *selectedMembership.Organization.Login),
+				Message: fmt.Sprintf("You aren't a member of an authorized team in the %v Github organization(s)!", organizationNames),
 			})
 			return
 		}
@@ -178,9 +192,12 @@ type OIDCConfig struct {
 	httpmw.OAuth2Config
 
 	Verifier *oidc.IDTokenVerifier
-	// EmailDomain is the domain to enforce when a user authenticates.
-	EmailDomain  string
+	// EmailDomains are the domains to enforce when a user authenticates.
+	EmailDomain  []string
 	AllowSignups bool
+	// IgnoreEmailVerified allows ignoring the email_verified claim
+	// from an upstream OIDC provider. See #5065 for context.
+	IgnoreEmailVerified bool
 }
 
 func (api *API) userOIDC(rw http.ResponseWriter, r *http.Request) {
@@ -219,12 +236,25 @@ func (api *API) userOIDC(rw http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	usernameRaw, ok := claims["preferred_username"]
+	var username string
+	if ok {
+		username, _ = usernameRaw.(string)
+	}
 	emailRaw, ok := claims["email"]
 	if !ok {
-		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
-			Message: "No email found in OIDC payload!",
-		})
-		return
+		// Email is an optional claim in OIDC and
+		// instead the email is frequently sent in
+		// "preferred_username". See:
+		// https://github.com/coder/coder/issues/4472
+		_, err = mail.ParseAddress(username)
+		if err != nil {
+			httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
+				Message: "No email found in OIDC payload!",
+			})
+			return
+		}
+		emailRaw = username
 	}
 	email, ok := emailRaw.(string)
 	if !ok {
@@ -237,21 +267,20 @@ func (api *API) userOIDC(rw http.ResponseWriter, r *http.Request) {
 	if ok {
 		verified, ok := verifiedRaw.(bool)
 		if ok && !verified {
-			httpapi.Write(ctx, rw, http.StatusForbidden, codersdk.Response{
-				Message: fmt.Sprintf("Verify the %q email address on your OIDC provider to authenticate!", email),
-			})
-			return
+			if !api.OIDCConfig.IgnoreEmailVerified {
+				httpapi.Write(ctx, rw, http.StatusForbidden, codersdk.Response{
+					Message: fmt.Sprintf("Verify the %q email address on your OIDC provider to authenticate!", email),
+				})
+				return
+			}
+			api.Logger.Warn(ctx, "allowing unverified oidc email %q")
 		}
-	}
-	usernameRaw, ok := claims["preferred_username"]
-	var username string
-	if ok {
-		username, _ = usernameRaw.(string)
 	}
 	// The username is a required property in Coder. We make a best-effort
 	// attempt at using what the claims provide, but if that fails we will
 	// generate a random username.
-	if !httpapi.UsernameValid(username) {
+	usernameValid := httpapi.NameValid(username)
+	if usernameValid != nil {
 		// If no username is provided, we can default to use the email address.
 		// This will be converted in the from function below, so it's safe
 		// to keep the domain.
@@ -260,10 +289,17 @@ func (api *API) userOIDC(rw http.ResponseWriter, r *http.Request) {
 		}
 		username = httpapi.UsernameFrom(username)
 	}
-	if api.OIDCConfig.EmailDomain != "" {
-		if !strings.HasSuffix(email, api.OIDCConfig.EmailDomain) {
+	if len(api.OIDCConfig.EmailDomain) > 0 {
+		ok = false
+		for _, domain := range api.OIDCConfig.EmailDomain {
+			if strings.HasSuffix(strings.ToLower(email), strings.ToLower(domain)) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
 			httpapi.Write(ctx, rw, http.StatusForbidden, codersdk.Response{
-				Message: fmt.Sprintf("Your email %q is not a part of the %q domain!", email, api.OIDCConfig.EmailDomain),
+				Message: fmt.Sprintf("Your email %q is not in domains %q !", email, api.OIDCConfig.EmailDomain),
 			})
 			return
 		}
@@ -381,6 +417,38 @@ func (api *API) oauthLogin(r *http.Request, params oauthLoginParams) (*http.Cook
 				organizationID = organizations[0].ID
 			}
 
+			_, err := tx.GetUserByEmailOrUsername(ctx, database.GetUserByEmailOrUsernameParams{
+				Username: params.Username,
+			})
+			if err == nil {
+				var (
+					original      = params.Username
+					validUsername bool
+				)
+				for i := 0; i < 10; i++ {
+					alternate := fmt.Sprintf("%s-%s", original, namesgenerator.GetRandomName(1))
+
+					params.Username = httpapi.UsernameFrom(alternate)
+
+					_, err := tx.GetUserByEmailOrUsername(ctx, database.GetUserByEmailOrUsernameParams{
+						Username: params.Username,
+					})
+					if xerrors.Is(err, sql.ErrNoRows) {
+						validUsername = true
+						break
+					}
+					if err != nil {
+						return xerrors.Errorf("get user by email/username: %w", err)
+					}
+				}
+				if !validUsername {
+					return httpError{
+						code: http.StatusConflict,
+						msg:  fmt.Sprintf("exhausted alternatives for taken username %q", original),
+					}
+				}
+			}
+
 			user, _, err = api.CreateUser(ctx, tx, CreateUserRequest{
 				CreateUserRequest: codersdk.CreateUserRequest{
 					Email:          params.Email,
@@ -477,7 +545,7 @@ func (api *API) oauthLogin(r *http.Request, params oauthLoginParams) (*http.Cook
 		}
 
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		return nil, xerrors.Errorf("in tx: %w", err)
 	}

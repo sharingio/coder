@@ -1,10 +1,17 @@
 import { useActor, useSelector } from "@xstate/react"
 import { FeatureNames } from "api/types"
 import dayjs from "dayjs"
-import { useContext } from "react"
+import { useContext, useEffect } from "react"
 import { Helmet } from "react-helmet-async"
 import { useTranslation } from "react-i18next"
+import { useNavigate } from "react-router-dom"
+import {
+  getMaxDeadline,
+  getMaxDeadlineChange,
+  getMinDeadline,
+} from "util/schedule"
 import { selectFeatureVisibility } from "xServices/entitlements/entitlementsSelectors"
+import { quotaMachine } from "xServices/quotas/quotasXService"
 import { StateFrom } from "xstate"
 import { DeleteDialog } from "../../components/Dialogs/DeleteDialog/DeleteDialog"
 import {
@@ -21,16 +28,19 @@ import {
 
 interface WorkspaceReadyPageProps {
   workspaceState: StateFrom<typeof workspaceMachine>
+  quotaState: StateFrom<typeof quotaMachine>
   workspaceSend: (event: WorkspaceEvent) => void
 }
 
 export const WorkspaceReadyPage = ({
   workspaceState,
+  quotaState,
   workspaceSend,
 }: WorkspaceReadyPageProps): JSX.Element => {
   const [bannerState, bannerSend] = useActor(
     workspaceState.children["scheduleBannerMachine"],
   )
+  const deadline = bannerState.context.deadline
   const xServices = useContext(XServiceContext)
   const featureVisibility = useSelector(
     xServices.entitlementsXService,
@@ -39,6 +49,7 @@ export const WorkspaceReadyPage = ({
   const [buildInfoState] = useActor(xServices.buildInfoXService)
   const {
     workspace,
+    template,
     refreshWorkspaceWarning,
     builds,
     getBuildsError,
@@ -53,6 +64,12 @@ export const WorkspaceReadyPage = ({
   const canUpdateWorkspace = Boolean(permissions?.updateWorkspace)
   const { t } = useTranslation("workspacePage")
   const favicon = getFaviconByStatus(workspace.latest_build)
+  const navigate = useNavigate()
+
+  // keep banner machine in sync with workspace
+  useEffect(() => {
+    bannerSend({ type: "REFRESH_WORKSPACE", workspace })
+  }, [bannerSend, workspace])
 
   return (
     <>
@@ -71,30 +88,31 @@ export const WorkspaceReadyPage = ({
       </Helmet>
 
       <Workspace
-        bannerProps={{
-          isLoading: bannerState.hasTag("loading"),
-          onExtend: () => {
-            bannerSend({
-              type: "INCREASE_DEADLINE",
-              hours: 4,
-            })
-          },
-        }}
         scheduleProps={{
-          onDeadlineMinus: () => {
+          onDeadlineMinus: (hours: number) => {
             bannerSend({
               type: "DECREASE_DEADLINE",
-              hours: 1,
+              hours,
             })
           },
-          onDeadlinePlus: () => {
+          onDeadlinePlus: (hours: number) => {
             bannerSend({
               type: "INCREASE_DEADLINE",
-              hours: 1,
+              hours,
             })
           },
           deadlineMinusEnabled: () => !bannerState.matches("atMinDeadline"),
           deadlinePlusEnabled: () => !bannerState.matches("atMaxDeadline"),
+          maxDeadlineDecrease: deadline
+            ? getMaxDeadlineChange(deadline, getMinDeadline())
+            : 0,
+          maxDeadlineIncrease:
+            deadline && template
+              ? getMaxDeadlineChange(
+                  getMaxDeadline(workspace, template),
+                  deadline,
+                )
+              : 0,
         }}
         isUpdating={workspaceState.hasTag("updating")}
         workspace={workspace}
@@ -103,6 +121,7 @@ export const WorkspaceReadyPage = ({
         handleDelete={() => workspaceSend({ type: "ASK_DELETE" })}
         handleUpdate={() => workspaceSend({ type: "UPDATE" })}
         handleCancel={() => workspaceSend({ type: "CANCEL" })}
+        handleChangeVersion={() => navigate("change-version")}
         resources={workspace.latest_build.resources}
         builds={builds}
         canUpdateWorkspace={canUpdateWorkspace}
@@ -115,6 +134,8 @@ export const WorkspaceReadyPage = ({
         }}
         buildInfo={buildInfoState.context.buildInfo}
         applicationsHost={applicationsHost}
+        template={template}
+        quota_budget={quotaState.context.quota?.budget}
       />
       <DeleteDialog
         entity="workspace"

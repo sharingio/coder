@@ -20,21 +20,16 @@ export const TemplatePermissionsPage: FC<
   const organizationId = useOrganizationId()
   const { context } = useTemplateLayoutContext()
   const { template, permissions } = context
-  if (!template || !permissions) {
-    throw new Error(
-      "This page should not be displayed until template or permissions being loaded.",
-    )
-  }
   const { template_rbac: isTemplateRBACEnabled } = useFeatureVisibility()
   const [state, send] = useMachine(templateACLMachine, {
-    context: { templateId: template.id },
+    context: { templateId: template?.id },
   })
   const { templateACL, userToBeUpdated, groupToBeUpdated } = state.context
 
   return (
     <>
       <Helmet>
-        <title>{pageTitle(`${template.name} · Permissions`)}</title>
+        <title>{pageTitle(`${template?.name} · Permissions`)}</title>
       </Helmet>
       <ChooseOne>
         <Cond condition={!isTemplateRBACEnabled}>
@@ -69,7 +64,7 @@ export const TemplatePermissionsPage: FC<
           <TemplatePermissionsPageView
             organizationId={organizationId}
             templateACL={templateACL}
-            canUpdatePermissions={permissions.canUpdateTemplate}
+            canUpdatePermissions={Boolean(permissions?.canUpdateTemplate)}
             onAddUser={(user, role, reset) => {
               send("ADD_USER", { user, role, onDone: reset })
             }}

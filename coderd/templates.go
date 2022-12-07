@@ -22,13 +22,7 @@ import (
 	"github.com/coder/coder/coderd/httpmw"
 	"github.com/coder/coder/coderd/rbac"
 	"github.com/coder/coder/coderd/telemetry"
-	"github.com/coder/coder/coderd/util/ptr"
 	"github.com/coder/coder/codersdk"
-)
-
-var (
-	maxTTLDefault               = 24 * 7 * time.Hour
-	minAutostartIntervalDefault = time.Hour
 )
 
 // Auto-importable templates. These can be auto-imported after the first user
@@ -212,33 +206,23 @@ func (api *API) postTemplateByOrganization(rw http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	maxTTL := maxTTLDefault
-	if createTemplate.MaxTTLMillis != nil {
-		maxTTL = time.Duration(*createTemplate.MaxTTLMillis) * time.Millisecond
+	var ttl time.Duration
+	if createTemplate.DefaultTTLMillis != nil {
+		ttl = time.Duration(*createTemplate.DefaultTTLMillis) * time.Millisecond
 	}
-	if maxTTL < 0 {
+	if ttl < 0 {
 		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
 			Message: "Invalid create template request.",
 			Validations: []codersdk.ValidationError{
-				{Field: "max_ttl_ms", Detail: "Must be a positive integer."},
+				{Field: "default_ttl_ms", Detail: "Must be a positive integer."},
 			},
 		})
 		return
 	}
 
-	if maxTTL > maxTTLDefault {
-		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
-			Message: "Invalid create template request.",
-			Validations: []codersdk.ValidationError{
-				{Field: "max_ttl_ms", Detail: "Cannot be greater than " + maxTTLDefault.String()},
-			},
-		})
-		return
-	}
-
-	minAutostartInterval := minAutostartIntervalDefault
-	if !ptr.NilOrZero(createTemplate.MinAutostartIntervalMillis) {
-		minAutostartInterval = time.Duration(*createTemplate.MinAutostartIntervalMillis) * time.Millisecond
+	var allowUserCancelWorkspaceJobs bool
+	if createTemplate.AllowUserCancelWorkspaceJobs != nil {
+		allowUserCancelWorkspaceJobs = *createTemplate.AllowUserCancelWorkspaceJobs
 	}
 
 	var dbTemplate database.Template
@@ -246,17 +230,23 @@ func (api *API) postTemplateByOrganization(rw http.ResponseWriter, r *http.Reque
 	err = api.Database.InTx(func(tx database.Store) error {
 		now := database.Now()
 		dbTemplate, err = tx.InsertTemplate(ctx, database.InsertTemplateParams{
-			ID:                   uuid.New(),
-			CreatedAt:            now,
-			UpdatedAt:            now,
-			OrganizationID:       organization.ID,
-			Name:                 createTemplate.Name,
-			Provisioner:          importJob.Provisioner,
-			ActiveVersionID:      templateVersion.ID,
-			Description:          createTemplate.Description,
-			MaxTtl:               int64(maxTTL),
-			MinAutostartInterval: int64(minAutostartInterval),
-			CreatedBy:            apiKey.UserID,
+			ID:              uuid.New(),
+			CreatedAt:       now,
+			UpdatedAt:       now,
+			OrganizationID:  organization.ID,
+			Name:            createTemplate.Name,
+			Provisioner:     importJob.Provisioner,
+			ActiveVersionID: templateVersion.ID,
+			Description:     createTemplate.Description,
+			DefaultTTL:      int64(ttl),
+			CreatedBy:       apiKey.UserID,
+			UserACL:         database.TemplateACL{},
+			GroupACL: database.TemplateACL{
+				organization.ID.String(): []rbac.Action{rbac.ActionRead},
+			},
+			DisplayName:                  createTemplate.DisplayName,
+			Icon:                         createTemplate.Icon,
+			AllowUserCancelWorkspaceJobs: allowUserCancelWorkspaceJobs,
 		})
 		if err != nil {
 			return xerrors.Errorf("insert template: %s", err)
@@ -299,13 +289,6 @@ func (api *API) postTemplateByOrganization(rw http.ResponseWriter, r *http.Reque
 			}
 		}
 
-		err = tx.UpdateTemplateGroupACLByID(ctx, dbTemplate.ID, database.TemplateACL{
-			dbTemplate.OrganizationID.String(): []rbac.Action{rbac.ActionRead},
-		})
-		if err != nil {
-			return xerrors.Errorf("update template group acl: %w", err)
-		}
-
 		createdByNameMap, err := getCreatedByNamesByTemplateIDs(ctx, tx, []database.Template{dbTemplate})
 		if err != nil {
 			return xerrors.Errorf("get creator name: %w", err)
@@ -313,7 +296,7 @@ func (api *API) postTemplateByOrganization(rw http.ResponseWriter, r *http.Reque
 
 		template = api.convertTemplate(dbTemplate, 0, createdByNameMap[dbTemplate.ID.String()])
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
 			Message: "Internal error inserting template.",
@@ -333,25 +316,27 @@ func (api *API) postTemplateByOrganization(rw http.ResponseWriter, r *http.Reque
 func (api *API) templatesByOrganization(rw http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	organization := httpmw.OrganizationParam(r)
-	templates, err := api.Database.GetTemplatesWithFilter(ctx, database.GetTemplatesWithFilterParams{
-		OrganizationID: organization.ID,
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		err = nil
-	}
+
+	prepared, err := api.HTTPAuth.AuthorizeSQLFilter(r, rbac.ActionRead, rbac.ResourceTemplate.Type)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching templates in organization.",
+			Message: "Internal error preparing sql filter.",
 			Detail:  err.Error(),
 		})
 		return
 	}
 
 	// Filter templates based on rbac permissions
-	templates, err = AuthorizeFilter(api.HTTPAuth, r, rbac.ActionRead, templates)
+	templates, err := api.Database.GetAuthorizedTemplates(ctx, database.GetTemplatesWithFilterParams{
+		OrganizationID: organization.ID,
+	}, prepared)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching templates.",
+			Message: "Internal error fetching templates in organization.",
 			Detail:  err.Error(),
 		})
 		return
@@ -467,14 +452,8 @@ func (api *API) patchTemplateMeta(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	var validErrs []codersdk.ValidationError
-	if req.MaxTTLMillis < 0 {
-		validErrs = append(validErrs, codersdk.ValidationError{Field: "max_ttl_ms", Detail: "Must be a positive integer."})
-	}
-	if req.MinAutostartIntervalMillis < 0 {
-		validErrs = append(validErrs, codersdk.ValidationError{Field: "min_autostart_interval_ms", Detail: "Must be a positive integer."})
-	}
-	if req.MaxTTLMillis > maxTTLDefault.Milliseconds() {
-		validErrs = append(validErrs, codersdk.ValidationError{Field: "max_ttl_ms", Detail: "Cannot be greater than " + maxTTLDefault.String()})
+	if req.DefaultTTLMillis < 0 {
+		validErrs = append(validErrs, codersdk.ValidationError{Field: "default_ttl_ms", Detail: "Must be a positive integer."})
 	}
 
 	if len(validErrs) > 0 {
@@ -503,18 +482,22 @@ func (api *API) patchTemplateMeta(rw http.ResponseWriter, r *http.Request) {
 
 		if req.Name == template.Name &&
 			req.Description == template.Description &&
+			req.DisplayName == template.DisplayName &&
 			req.Icon == template.Icon &&
-			req.MaxTTLMillis == time.Duration(template.MaxTtl).Milliseconds() &&
-			req.MinAutostartIntervalMillis == time.Duration(template.MinAutostartInterval).Milliseconds() {
+			req.AllowUserCancelWorkspaceJobs == template.AllowUserCancelWorkspaceJobs &&
+			req.DefaultTTLMillis == time.Duration(template.DefaultTTL).Milliseconds() {
 			return nil
 		}
 
-		// Update template metadata -- empty fields are not overwritten.
+		// Update template metadata -- empty fields are not overwritten,
+		// except for display_name, icon, and default_ttl.
+		// The exception is required to clear content of these fields with UI.
 		name := req.Name
+		displayName := req.DisplayName
 		desc := req.Description
 		icon := req.Icon
-		maxTTL := time.Duration(req.MaxTTLMillis) * time.Millisecond
-		minAutostartInterval := time.Duration(req.MinAutostartIntervalMillis) * time.Millisecond
+		maxTTL := time.Duration(req.DefaultTTLMillis) * time.Millisecond
+		allowUserCancelWorkspaceJobs := req.AllowUserCancelWorkspaceJobs
 
 		if name == "" {
 			name = template.Name
@@ -522,25 +505,23 @@ func (api *API) patchTemplateMeta(rw http.ResponseWriter, r *http.Request) {
 		if desc == "" {
 			desc = template.Description
 		}
-		if minAutostartInterval == 0 {
-			minAutostartInterval = time.Duration(template.MinAutostartInterval)
-		}
 
 		updated, err = tx.UpdateTemplateMetaByID(ctx, database.UpdateTemplateMetaByIDParams{
-			ID:                   template.ID,
-			UpdatedAt:            database.Now(),
-			Name:                 name,
-			Description:          desc,
-			Icon:                 icon,
-			MaxTtl:               int64(maxTTL),
-			MinAutostartInterval: int64(minAutostartInterval),
+			ID:                           template.ID,
+			UpdatedAt:                    database.Now(),
+			Name:                         name,
+			DisplayName:                  displayName,
+			Description:                  desc,
+			Icon:                         icon,
+			DefaultTTL:                   int64(maxTTL),
+			AllowUserCancelWorkspaceJobs: allowUserCancelWorkspaceJobs,
 		})
 		if err != nil {
 			return err
 		}
 
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		httpapi.InternalServerError(rw, err)
 		return
@@ -600,6 +581,7 @@ func (api *API) autoImportTemplate(ctx context.Context, opts autoImportTemplateO
 			now  = database.Now()
 		)
 		file, err := tx.InsertFile(ctx, database.InsertFileParams{
+			ID:        uuid.New(),
 			Hash:      hex.EncodeToString(hash[:]),
 			CreatedAt: now,
 			CreatedBy: opts.userID,
@@ -639,7 +621,7 @@ func (api *API) autoImportTemplate(ctx context.Context, opts autoImportTemplateO
 			InitiatorID:    opts.userID,
 			Provisioner:    database.ProvisionerTypeTerraform,
 			StorageMethod:  database.ProvisionerStorageMethodFile,
-			StorageSource:  file.Hash,
+			FileID:         file.ID,
 			Type:           database.ProvisionerJobTypeTemplateVersionImport,
 			Input:          []byte{'{', '}'},
 		})
@@ -660,10 +642,7 @@ func (api *API) autoImportTemplate(ctx context.Context, opts autoImportTemplateO
 			Name:           namesgenerator.GetRandomName(1),
 			Readme:         "",
 			JobID:          job.ID,
-			CreatedBy: uuid.NullUUID{
-				UUID:  opts.userID,
-				Valid: true,
-			},
+			CreatedBy:      opts.userID,
 		})
 		if err != nil {
 			return xerrors.Errorf("insert template version: %w", err)
@@ -671,17 +650,20 @@ func (api *API) autoImportTemplate(ctx context.Context, opts autoImportTemplateO
 
 		// Create template
 		template, err = tx.InsertTemplate(ctx, database.InsertTemplateParams{
-			ID:                   uuid.New(),
-			CreatedAt:            now,
-			UpdatedAt:            now,
-			OrganizationID:       opts.orgID,
-			Name:                 opts.name,
-			Provisioner:          job.Provisioner,
-			ActiveVersionID:      templateVersion.ID,
-			Description:          "This template was auto-imported by Coder.",
-			MaxTtl:               int64(maxTTLDefault),
-			MinAutostartInterval: int64(minAutostartIntervalDefault),
-			CreatedBy:            opts.userID,
+			ID:              uuid.New(),
+			CreatedAt:       now,
+			UpdatedAt:       now,
+			OrganizationID:  opts.orgID,
+			Name:            opts.name,
+			Provisioner:     job.Provisioner,
+			ActiveVersionID: templateVersion.ID,
+			Description:     "This template was auto-imported by Coder.",
+			DefaultTTL:      0,
+			CreatedBy:       opts.userID,
+			UserACL:         database.TemplateACL{},
+			GroupACL: database.TemplateACL{
+				opts.orgID.String(): []rbac.Action{rbac.ActionRead},
+			},
 		})
 		if err != nil {
 			return xerrors.Errorf("insert template: %w", err)
@@ -717,15 +699,8 @@ func (api *API) autoImportTemplate(ctx context.Context, opts autoImportTemplateO
 			}
 		}
 
-		err = tx.UpdateTemplateGroupACLByID(ctx, template.ID, database.TemplateACL{
-			opts.orgID.String(): []rbac.Action{rbac.ActionRead},
-		})
-		if err != nil {
-			return xerrors.Errorf("update template group acl: %w", err)
-		}
-
 		return nil
-	})
+	}, nil)
 
 	return template, err
 }
@@ -772,21 +747,26 @@ func (api *API) convertTemplate(
 	template database.Template, workspaceOwnerCount uint32, createdByName string,
 ) codersdk.Template {
 	activeCount, _ := api.metricsCache.TemplateUniqueUsers(template.ID)
+
+	buildTimeStats := api.metricsCache.TemplateBuildTimeStats(template.ID)
+
 	return codersdk.Template{
-		ID:                         template.ID,
-		CreatedAt:                  template.CreatedAt,
-		UpdatedAt:                  template.UpdatedAt,
-		OrganizationID:             template.OrganizationID,
-		Name:                       template.Name,
-		Provisioner:                codersdk.ProvisionerType(template.Provisioner),
-		ActiveVersionID:            template.ActiveVersionID,
-		WorkspaceOwnerCount:        workspaceOwnerCount,
-		ActiveUserCount:            activeCount,
-		Description:                template.Description,
-		Icon:                       template.Icon,
-		MaxTTLMillis:               time.Duration(template.MaxTtl).Milliseconds(),
-		MinAutostartIntervalMillis: time.Duration(template.MinAutostartInterval).Milliseconds(),
-		CreatedByID:                template.CreatedBy,
-		CreatedByName:              createdByName,
+		ID:                           template.ID,
+		CreatedAt:                    template.CreatedAt,
+		UpdatedAt:                    template.UpdatedAt,
+		OrganizationID:               template.OrganizationID,
+		Name:                         template.Name,
+		DisplayName:                  template.DisplayName,
+		Provisioner:                  codersdk.ProvisionerType(template.Provisioner),
+		ActiveVersionID:              template.ActiveVersionID,
+		WorkspaceOwnerCount:          workspaceOwnerCount,
+		ActiveUserCount:              activeCount,
+		BuildTimeStats:               buildTimeStats,
+		Description:                  template.Description,
+		Icon:                         template.Icon,
+		DefaultTTLMillis:             time.Duration(template.DefaultTTL).Milliseconds(),
+		CreatedByID:                  template.CreatedBy,
+		CreatedByName:                createdByName,
+		AllowUserCancelWorkspaceJobs: template.AllowUserCancelWorkspaceJobs,
 	}
 }

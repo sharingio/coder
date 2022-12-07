@@ -3,7 +3,7 @@ import { WorkspaceBuildTransition } from "../api/types"
 import { CreateWorkspaceBuildRequest } from "../api/typesGenerated"
 import { permissionsToCheck } from "../xServices/auth/authXService"
 import * as M from "./entities"
-import { MockGroup } from "./entities"
+import { MockGroup, MockWorkspaceQuota } from "./entities"
 
 export const handlers = [
   rest.get("/api/v2/templates/:templateId/daus", async (req, res, ctx) => {
@@ -13,6 +13,11 @@ export const handlers = [
   // build info
   rest.get("/api/v2/buildinfo", async (req, res, ctx) => {
     return res(ctx.status(200), ctx.json(M.MockBuildInfo))
+  }),
+
+  // update check
+  rest.get("/api/v2/updatecheck", async (req, res, ctx) => {
+    return res(ctx.status(200), ctx.json(M.MockUpdateCheck))
   }),
 
   // organizations
@@ -37,7 +42,10 @@ export const handlers = [
     return res(ctx.status(200), ctx.json(M.MockTemplate))
   }),
   rest.get("/api/v2/templates/:templateId/versions", async (req, res, ctx) => {
-    return res(ctx.status(200), ctx.json([M.MockTemplateVersion]))
+    return res(
+      ctx.status(200),
+      ctx.json([M.MockTemplateVersion2, M.MockTemplateVersion]),
+    )
   }),
   rest.patch("/api/v2/templates/:templateId", async (req, res, ctx) => {
     return res(ctx.status(200), ctx.json(M.MockTemplate))
@@ -63,6 +71,12 @@ export const handlers = [
       )
     },
   ),
+  rest.get(
+    "api/v2/organizations/:organizationId/templateversions/:templateVersionName",
+    async (req, res, ctx) => {
+      return res(ctx.status(200), ctx.json(M.MockTemplateVersion))
+    },
+  ),
   rest.delete("/api/v2/templates/:templateId", async (req, res, ctx) => {
     return res(ctx.status(200), ctx.json(M.MockTemplate))
   }),
@@ -71,7 +85,10 @@ export const handlers = [
   rest.get("/api/v2/users", async (req, res, ctx) => {
     return res(
       ctx.status(200),
-      ctx.json([M.MockUser, M.MockUser2, M.SuspendedMockUser]),
+      ctx.json({
+        users: [M.MockUser, M.MockUser2, M.SuspendedMockUser],
+        count: 26,
+      }),
     )
   }),
   rest.post("/api/v2/users", async (req, res, ctx) => {
@@ -138,7 +155,7 @@ export const handlers = [
 
   // workspaces
   rest.get("/api/v2/workspaces", async (req, res, ctx) => {
-    return res(ctx.status(200), ctx.json([M.MockWorkspace]))
+    return res(ctx.status(200), ctx.json(M.MockWorkspacesResponse))
   }),
   rest.get("/api/v2/workspaces/:workspaceId", async (req, res, ctx) => {
     return res(ctx.status(200), ctx.json(M.MockWorkspace))
@@ -203,21 +220,23 @@ export const handlers = [
 
   // Audit
   rest.get("/api/v2/audit", (req, res, ctx) => {
+    const filter = req.url.searchParams.get("q") as string
+    const logs =
+      filter === "resource_type:workspace action:create"
+        ? [M.MockAuditLog]
+        : [M.MockAuditLog, M.MockAuditLog2]
     return res(
       ctx.status(200),
       ctx.json({
-        audit_logs: [M.MockAuditLog, M.MockAuditLog2],
+        audit_logs: logs,
+        count: logs.length,
       }),
     )
   }),
 
-  rest.get("/api/v2/audit/count", (req, res, ctx) => {
-    return res(ctx.status(200), ctx.json({ count: 1000 }))
-  }),
-
   // Applications host
   rest.get("/api/v2/applications/host", (req, res, ctx) => {
-    return res(ctx.status(200), ctx.json({ host: "dev.coder.com" }))
+    return res(ctx.status(200), ctx.json({ host: "*.dev.coder.com" }))
   }),
 
   // Groups
@@ -242,5 +261,9 @@ export const handlers = [
 
   rest.delete("/api/v2/groups/:groupId", (req, res, ctx) => {
     return res(ctx.status(204))
+  }),
+
+  rest.get("/api/v2/workspace-quota/:userId", (req, res, ctx) => {
+    return res(ctx.status(200), ctx.json(MockWorkspaceQuota))
   }),
 ]

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -26,14 +27,18 @@ import (
 	"github.com/gliderlabs/ssh"
 	"github.com/google/uuid"
 	"github.com/pkg/sftp"
+	"github.com/spf13/afero"
 	"go.uber.org/atomic"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/xerrors"
 	"tailscale.com/net/speedtest"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/netlogtype"
 
 	"cdr.dev/slog"
 	"github.com/coder/coder/agent/usershell"
+	"github.com/coder/coder/buildinfo"
+	"github.com/coder/coder/coderd/gitauth"
 	"github.com/coder/coder/codersdk"
 	"github.com/coder/coder/pty"
 	"github.com/coder/coder/tailnet"
@@ -52,47 +57,60 @@ const (
 )
 
 type Options struct {
-	CoordinatorDialer           CoordinatorDialer
-	FetchMetadata               FetchMetadata
-	StatsReporter               StatsReporter
-	WorkspaceAgentApps          WorkspaceAgentApps
-	PostWorkspaceAgentAppHealth PostWorkspaceAgentAppHealth
-	ReconnectingPTYTimeout      time.Duration
-	EnvironmentVariables        map[string]string
-	Logger                      slog.Logger
+	Filesystem             afero.Fs
+	TempDir                string
+	ExchangeToken          func(ctx context.Context) (string, error)
+	Client                 Client
+	ReconnectingPTYTimeout time.Duration
+	EnvironmentVariables   map[string]string
+	Logger                 slog.Logger
 }
 
-// CoordinatorDialer is a function that constructs a new broker.
-// A dialer must be passed in to allow for reconnects.
-type CoordinatorDialer func(context.Context) (net.Conn, error)
-
-// FetchMetadata is a function to obtain metadata for the agent.
-type FetchMetadata func(context.Context) (codersdk.WorkspaceAgentMetadata, error)
+type Client interface {
+	WorkspaceAgentMetadata(ctx context.Context) (codersdk.WorkspaceAgentMetadata, error)
+	ListenWorkspaceAgent(ctx context.Context) (net.Conn, error)
+	AgentReportStats(ctx context.Context, log slog.Logger, stats func() *codersdk.AgentStats) (io.Closer, error)
+	PostWorkspaceAgentAppHealth(ctx context.Context, req codersdk.PostWorkspaceAppHealthsRequest) error
+	PostWorkspaceAgentVersion(ctx context.Context, version string) error
+}
 
 func New(options Options) io.Closer {
 	if options.ReconnectingPTYTimeout == 0 {
 		options.ReconnectingPTYTimeout = 5 * time.Minute
 	}
+	if options.Filesystem == nil {
+		options.Filesystem = afero.NewOsFs()
+	}
+	if options.TempDir == "" {
+		options.TempDir = os.TempDir()
+	}
+	if options.ExchangeToken == nil {
+		options.ExchangeToken = func(ctx context.Context) (string, error) {
+			return "", nil
+		}
+	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	server := &agent{
-		reconnectingPTYTimeout:      options.ReconnectingPTYTimeout,
-		logger:                      options.Logger,
-		closeCancel:                 cancelFunc,
-		closed:                      make(chan struct{}),
-		envVars:                     options.EnvironmentVariables,
-		coordinatorDialer:           options.CoordinatorDialer,
-		fetchMetadata:               options.FetchMetadata,
-		stats:                       &Stats{},
-		statsReporter:               options.StatsReporter,
-		workspaceAgentApps:          options.WorkspaceAgentApps,
-		postWorkspaceAgentAppHealth: options.PostWorkspaceAgentAppHealth,
+		reconnectingPTYTimeout: options.ReconnectingPTYTimeout,
+		logger:                 options.Logger,
+		closeCancel:            cancelFunc,
+		closed:                 make(chan struct{}),
+		envVars:                options.EnvironmentVariables,
+		client:                 options.Client,
+		exchangeToken:          options.ExchangeToken,
+		filesystem:             options.Filesystem,
+		tempDir:                options.TempDir,
 	}
 	server.init(ctx)
 	return server
 }
 
 type agent struct {
-	logger slog.Logger
+	logger        slog.Logger
+	client        Client
+	exchangeToken func(ctx context.Context) (string, error)
+	filesystem    afero.Fs
+	tempDir       string
 
 	reconnectingPTYs       sync.Map
 	reconnectingPTYTimeout time.Duration
@@ -104,123 +122,189 @@ type agent struct {
 
 	envVars map[string]string
 	// metadata is atomic because values can change after reconnection.
-	metadata      atomic.Value
-	fetchMetadata FetchMetadata
-	sshServer     *ssh.Server
+	metadata     atomic.Value
+	sessionToken atomic.Pointer[string]
+	sshServer    *ssh.Server
 
-	network                     *tailnet.Conn
-	coordinatorDialer           CoordinatorDialer
-	stats                       *Stats
-	statsReporter               StatsReporter
-	workspaceAgentApps          WorkspaceAgentApps
-	postWorkspaceAgentAppHealth PostWorkspaceAgentAppHealth
+	network *tailnet.Conn
 }
 
-func (a *agent) run(ctx context.Context) {
-	var metadata codersdk.WorkspaceAgentMetadata
-	var err error
-	// An exponential back-off occurs when the connection is failing to dial.
-	// This is to prevent server spam in case of a coderd outage.
-	for retrier := retry.New(50*time.Millisecond, 10*time.Second); retrier.Wait(ctx); {
-		a.logger.Info(ctx, "connecting")
-		metadata, err = a.fetchMetadata(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			if a.isClosed() {
-				return
-			}
-			a.logger.Warn(context.Background(), "failed to dial", slog.Error(err))
+// runLoop attempts to start the agent in a retry loop.
+// Coder may be offline temporarily, a connection issue
+// may be happening, but regardless after the intermittent
+// failure, you'll want the agent to reconnect.
+func (a *agent) runLoop(ctx context.Context) {
+	for retrier := retry.New(100*time.Millisecond, 10*time.Second); retrier.Wait(ctx); {
+		a.logger.Info(ctx, "running loop")
+		err := a.run(ctx)
+		// Cancel after the run is complete to clean up any leaked resources!
+		if err == nil {
 			continue
 		}
-		a.logger.Info(context.Background(), "fetched metadata")
-		break
-	}
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-	a.metadata.Store(metadata)
-
-	// The startup script has not ran yet!
-	go func() {
-		err := a.runStartupScript(ctx, metadata.StartupScript)
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		if err != nil {
-			a.logger.Warn(ctx, "agent script failed", slog.Error(err))
+		if a.isClosed() {
+			return
 		}
-	}()
-
-	if metadata.DERPMap != nil {
-		go a.runTailnet(ctx, metadata.DERPMap)
-	}
-
-	if a.workspaceAgentApps != nil && a.postWorkspaceAgentAppHealth != nil {
-		go NewWorkspaceAppHealthReporter(a.logger, a.workspaceAgentApps, a.postWorkspaceAgentAppHealth)(ctx)
+		if errors.Is(err, io.EOF) {
+			a.logger.Info(ctx, "likely disconnected from coder", slog.Error(err))
+			continue
+		}
+		a.logger.Warn(ctx, "run exited with error", slog.Error(err))
 	}
 }
 
-func (a *agent) runTailnet(ctx context.Context, derpMap *tailcfg.DERPMap) {
+func (a *agent) run(ctx context.Context) error {
+	// This allows the agent to refresh it's token if necessary.
+	// For instance identity this is required, since the instance
+	// may not have re-provisioned, but a new agent ID was created.
+	sessionToken, err := a.exchangeToken(ctx)
+	if err != nil {
+		return xerrors.Errorf("exchange token: %w", err)
+	}
+	a.sessionToken.Store(&sessionToken)
+
+	err = a.client.PostWorkspaceAgentVersion(ctx, buildinfo.Version())
+	if err != nil {
+		return xerrors.Errorf("update workspace agent version: %w", err)
+	}
+
+	metadata, err := a.client.WorkspaceAgentMetadata(ctx)
+	if err != nil {
+		return xerrors.Errorf("fetch metadata: %w", err)
+	}
+	a.logger.Info(ctx, "fetched metadata")
+	oldMetadata := a.metadata.Swap(metadata)
+
+	// The startup script should only execute on the first run!
+	if oldMetadata == nil {
+		go func() {
+			err := a.runStartupScript(ctx, metadata.StartupScript)
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if err != nil {
+				a.logger.Warn(ctx, "agent script failed", slog.Error(err))
+			}
+		}()
+	}
+
+	if metadata.GitAuthConfigs > 0 {
+		err = gitauth.OverrideVSCodeConfigs(a.filesystem)
+		if err != nil {
+			return xerrors.Errorf("override vscode configuration for git auth: %w", err)
+		}
+	}
+
+	// This automatically closes when the context ends!
+	appReporterCtx, appReporterCtxCancel := context.WithCancel(ctx)
+	defer appReporterCtxCancel()
+	go NewWorkspaceAppHealthReporter(
+		a.logger, metadata.Apps, a.client.PostWorkspaceAgentAppHealth)(appReporterCtx)
+
+	a.logger.Debug(ctx, "running tailnet with derpmap", slog.F("derpmap", metadata.DERPMap))
+
+	a.closeMutex.Lock()
+	network := a.network
+	a.closeMutex.Unlock()
+	if network == nil {
+		a.logger.Debug(ctx, "creating tailnet")
+		network, err = a.createTailnet(ctx, metadata.DERPMap)
+		if err != nil {
+			return xerrors.Errorf("create tailnet: %w", err)
+		}
+		a.closeMutex.Lock()
+		a.network = network
+		a.closeMutex.Unlock()
+	} else {
+		// Update the DERP map!
+		network.SetDERPMap(metadata.DERPMap)
+	}
+
+	a.logger.Debug(ctx, "running coordinator")
+	err = a.runCoordinator(ctx, network)
+	if err != nil {
+		a.logger.Debug(ctx, "coordinator exited", slog.Error(err))
+		return xerrors.Errorf("run coordinator: %w", err)
+	}
+	return nil
+}
+
+func (a *agent) trackConnGoroutine(fn func()) error {
 	a.closeMutex.Lock()
 	defer a.closeMutex.Unlock()
 	if a.isClosed() {
-		return
+		return xerrors.New("track conn goroutine: agent is closed")
 	}
-	if a.network != nil {
-		a.network.SetDERPMap(derpMap)
-		return
-	}
-	var err error
-	a.network, err = tailnet.NewConn(&tailnet.Options{
-		Addresses: []netip.Prefix{netip.PrefixFrom(codersdk.TailnetIP, 128)},
-		DERPMap:   derpMap,
-		Logger:    a.logger.Named("tailnet"),
-	})
-	if err != nil {
-		a.logger.Critical(ctx, "create tailnet", slog.Error(err))
-		return
-	}
-	a.network.SetForwardTCPCallback(func(conn net.Conn, listenerExists bool) net.Conn {
-		if listenerExists {
-			// If a listener already exists, we would double-wrap the conn.
-			return conn
-		}
-		return a.stats.wrapConn(conn)
-	})
-	go a.runCoordinator(ctx)
-
-	sshListener, err := a.network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetSSHPort))
-	if err != nil {
-		a.logger.Critical(ctx, "listen for ssh", slog.Error(err))
-		return
-	}
+	a.connCloseWait.Add(1)
 	go func() {
+		defer a.connCloseWait.Done()
+		fn()
+	}()
+	return nil
+}
+
+func (a *agent) createTailnet(ctx context.Context, derpMap *tailcfg.DERPMap) (_ *tailnet.Conn, err error) {
+	a.closeMutex.Lock()
+	if a.isClosed() {
+		a.closeMutex.Unlock()
+		return nil, xerrors.New("closed")
+	}
+	network, err := tailnet.NewConn(&tailnet.Options{
+		Addresses:          []netip.Prefix{netip.PrefixFrom(codersdk.TailnetIP, 128)},
+		DERPMap:            derpMap,
+		Logger:             a.logger.Named("tailnet"),
+		EnableTrafficStats: true,
+	})
+	if err != nil {
+		a.closeMutex.Unlock()
+		return nil, xerrors.Errorf("create tailnet: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			network.Close()
+		}
+	}()
+	a.closeMutex.Unlock()
+
+	sshListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetSSHPort))
+	if err != nil {
+		return nil, xerrors.Errorf("listen on the ssh port: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = sshListener.Close()
+		}
+	}()
+	if err = a.trackConnGoroutine(func() {
 		for {
 			conn, err := sshListener.Accept()
 			if err != nil {
 				return
 			}
-			go a.sshServer.HandleConn(a.stats.wrapConn(conn))
+			go a.sshServer.HandleConn(conn)
+		}
+	}); err != nil {
+		return nil, err
+	}
+
+	reconnectingPTYListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetReconnectingPTYPort))
+	if err != nil {
+		return nil, xerrors.Errorf("listen for reconnecting pty: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = reconnectingPTYListener.Close()
 		}
 	}()
-
-	reconnectingPTYListener, err := a.network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetReconnectingPTYPort))
-	if err != nil {
-		a.logger.Critical(ctx, "listen for reconnecting pty", slog.Error(err))
-		return
-	}
-	go func() {
+	if err = a.trackConnGoroutine(func() {
 		for {
 			conn, err := reconnectingPTYListener.Accept()
 			if err != nil {
 				a.logger.Debug(ctx, "accept pty failed", slog.Error(err))
 				return
 			}
-			conn = a.stats.wrapConn(conn)
 			// This cannot use a JSON decoder, since that can
 			// buffer additional data that is required for the PTY.
 			rawLen := make([]byte, 2)
@@ -241,36 +325,48 @@ func (a *agent) runTailnet(ctx context.Context, derpMap *tailcfg.DERPMap) {
 			}
 			go a.handleReconnectingPTY(ctx, msg, conn)
 		}
-	}()
-
-	speedtestListener, err := a.network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetSpeedtestPort))
-	if err != nil {
-		a.logger.Critical(ctx, "listen for speedtest", slog.Error(err))
-		return
+	}); err != nil {
+		return nil, err
 	}
-	go func() {
+
+	speedtestListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetSpeedtestPort))
+	if err != nil {
+		return nil, xerrors.Errorf("listen for speedtest: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = speedtestListener.Close()
+		}
+	}()
+	if err = a.trackConnGoroutine(func() {
 		for {
 			conn, err := speedtestListener.Accept()
 			if err != nil {
 				a.logger.Debug(ctx, "speedtest listener failed", slog.Error(err))
 				return
 			}
-			a.closeMutex.Lock()
-			a.connCloseWait.Add(1)
-			a.closeMutex.Unlock()
-			go func() {
-				defer a.connCloseWait.Done()
+			if err = a.trackConnGoroutine(func() {
 				_ = speedtest.ServeConn(conn)
-			}()
+			}); err != nil {
+				a.logger.Debug(ctx, "speedtest listener failed", slog.Error(err))
+				_ = conn.Close()
+				return
+			}
+		}
+	}); err != nil {
+		return nil, err
+	}
+
+	statisticsListener, err := network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetStatisticsPort))
+	if err != nil {
+		return nil, xerrors.Errorf("listen for statistics: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = statisticsListener.Close()
 		}
 	}()
-
-	statisticsListener, err := a.network.Listen("tcp", ":"+strconv.Itoa(codersdk.TailnetStatisticsPort))
-	if err != nil {
-		a.logger.Critical(ctx, "listen for statistics", slog.Error(err))
-		return
-	}
-	go func() {
+	if err = a.trackConnGoroutine(func() {
 		defer statisticsListener.Close()
 		server := &http.Server{
 			Handler:           a.statisticsHandler(),
@@ -284,64 +380,33 @@ func (a *agent) runTailnet(ctx context.Context, derpMap *tailcfg.DERPMap) {
 			_ = server.Close()
 		}()
 
-		err = server.Serve(statisticsListener)
+		err := server.Serve(statisticsListener)
 		if err != nil && !xerrors.Is(err, http.ErrServerClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
 			a.logger.Critical(ctx, "serve statistics HTTP server", slog.Error(err))
 		}
-	}()
+	}); err != nil {
+		return nil, err
+	}
+
+	return network, nil
 }
 
-// runCoordinator listens for nodes and updates the self-node as it changes.
-func (a *agent) runCoordinator(ctx context.Context) {
-	for {
-		reconnect := a.runCoordinatorWithRetry(ctx)
-		if !reconnect {
-			return
-		}
+// runCoordinator runs a coordinator and returns whether a reconnect
+// should occur.
+func (a *agent) runCoordinator(ctx context.Context, network *tailnet.Conn) error {
+	coordinator, err := a.client.ListenWorkspaceAgent(ctx)
+	if err != nil {
+		return err
 	}
-}
-
-func (a *agent) runCoordinatorWithRetry(ctx context.Context) (reconnect bool) {
-	var coordinator net.Conn
-	var err error
-	// An exponential back-off occurs when the connection is failing to dial.
-	// This is to prevent server spam in case of a coderd outage.
-	for retrier := retry.New(50*time.Millisecond, 10*time.Second); retrier.Wait(ctx); {
-		coordinator, err = a.coordinatorDialer(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return false
-			}
-			if a.isClosed() {
-				return false
-			}
-			a.logger.Warn(context.Background(), "failed to dial", slog.Error(err))
-			continue
-		}
-		//nolint:revive // Defer is ok because we're exiting this loop.
-		defer coordinator.Close()
-		a.logger.Info(context.Background(), "connected to coordination server")
-		break
-	}
+	defer coordinator.Close()
+	a.logger.Info(ctx, "connected to coordination server")
+	sendNodes, errChan := tailnet.ServeCoordinator(coordinator, network.UpdateNodes)
+	network.SetNodeCallback(sendNodes)
 	select {
 	case <-ctx.Done():
-		return false
-	default:
-	}
-	sendNodes, errChan := tailnet.ServeCoordinator(coordinator, a.network.UpdateNodes)
-	a.network.SetNodeCallback(sendNodes)
-	select {
-	case <-ctx.Done():
-		return false
+		return ctx.Err()
 	case err := <-errChan:
-		if a.isClosed() {
-			return false
-		}
-		if errors.Is(err, context.Canceled) {
-			return false
-		}
-		a.logger.Debug(ctx, "node broker accept exited; restarting connection", slog.Error(err))
-		return true
+		return err
 	}
 }
 
@@ -350,14 +415,14 @@ func (a *agent) runStartupScript(ctx context.Context, script string) error {
 		return nil
 	}
 
-	writer, err := os.OpenFile(filepath.Join(os.TempDir(), "coder-startup-script.log"), os.O_CREATE|os.O_RDWR, 0o600)
+	a.logger.Info(ctx, "running startup script", slog.F("script", script))
+	writer, err := a.filesystem.OpenFile(filepath.Join(a.tempDir, "coder-startup-script.log"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return xerrors.Errorf("open startup script log file: %w", err)
 	}
 	defer func() {
 		_ = writer.Close()
 	}()
-
 	cmd, err := a.createCommand(ctx, script, nil)
 	if err != nil {
 		return xerrors.Errorf("create command: %w", err)
@@ -445,39 +510,90 @@ func (a *agent) init(ctx context.Context) {
 		},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{
 			"sftp": func(session ssh.Session) {
+				ctx := session.Context()
+
+				// Typically sftp sessions don't request a TTY, but if they do,
+				// we must ensure the gliderlabs/ssh CRLF emulation is disabled.
+				// Otherwise sftp will be broken. This can happen if a user sets
+				// `RequestTTY force` in their SSH config.
 				session.DisablePTYEmulation()
 
-				server, err := sftp.NewServer(session)
+				var opts []sftp.ServerOption
+				// Change current working directory to the users home
+				// directory so that SFTP connections land there.
+				homedir, err := userHomeDir()
 				if err != nil {
-					a.logger.Debug(session.Context(), "initialize sftp server", slog.Error(err))
+					sshLogger.Warn(ctx, "get sftp working directory failed, unable to get home dir", slog.Error(err))
+				} else {
+					opts = append(opts, sftp.WithServerWorkingDirectory(homedir))
+				}
+
+				server, err := sftp.NewServer(session, opts...)
+				if err != nil {
+					sshLogger.Debug(ctx, "initialize sftp server", slog.Error(err))
 					return
 				}
 				defer server.Close()
+
 				err = server.Serve()
 				if errors.Is(err, io.EOF) {
+					// Unless we call `session.Exit(0)` here, the client won't
+					// receive `exit-status` because `(*sftp.Server).Close()`
+					// calls `Close()` on the underlying connection (session),
+					// which actually calls `channel.Close()` because it isn't
+					// wrapped. This causes sftp clients to receive a non-zero
+					// exit code. Typically sftp clients don't echo this exit
+					// code but `scp` on macOS does (when using the default
+					// SFTP backend).
+					_ = session.Exit(0)
 					return
 				}
-				a.logger.Debug(session.Context(), "sftp server exited with error", slog.Error(err))
+				sshLogger.Warn(ctx, "sftp server closed with error", slog.Error(err))
+				_ = session.Exit(1)
 			},
 		},
 	}
 
-	go a.run(ctx)
-	if a.statsReporter != nil {
-		cl, err := a.statsReporter(ctx, a.logger, func() *codersdk.AgentStats {
-			return a.stats.Copy()
-		})
-		if err != nil {
-			a.logger.Error(ctx, "report stats", slog.Error(err))
-			return
+	go a.runLoop(ctx)
+	cl, err := a.client.AgentReportStats(ctx, a.logger, func() *codersdk.AgentStats {
+		stats := map[netlogtype.Connection]netlogtype.Counts{}
+		a.closeMutex.Lock()
+		if a.network != nil {
+			stats = a.network.ExtractTrafficStats()
 		}
-		a.connCloseWait.Add(1)
-		go func() {
-			defer a.connCloseWait.Done()
-			<-a.closed
-			cl.Close()
-		}()
+		a.closeMutex.Unlock()
+		return convertAgentStats(stats)
+	})
+	if err != nil {
+		a.logger.Error(ctx, "report stats", slog.Error(err))
+		return
 	}
+
+	if err = a.trackConnGoroutine(func() {
+		<-a.closed
+		_ = cl.Close()
+	}); err != nil {
+		a.logger.Error(ctx, "report stats goroutine", slog.Error(err))
+		_ = cl.Close()
+		return
+	}
+}
+
+func convertAgentStats(counts map[netlogtype.Connection]netlogtype.Counts) *codersdk.AgentStats {
+	stats := &codersdk.AgentStats{
+		ConnsByProto: map[string]int64{},
+		NumConns:     int64(len(counts)),
+	}
+
+	for conn, count := range counts {
+		stats.ConnsByProto[conn.Proto.String()]++
+		stats.RxPackets += int64(count.RxPackets)
+		stats.RxBytes += int64(count.RxBytes)
+		stats.TxPackets += int64(count.TxPackets)
+		stats.TxBytes += int64(count.TxBytes)
+	}
+
+	return stats
 }
 
 // createCommand processes raw command input with OpenSSH-like behavior.
@@ -504,29 +620,34 @@ func (a *agent) createCommand(ctx context.Context, rawCommand string, env []stri
 		return nil, xerrors.Errorf("metadata is the wrong type: %T", metadata)
 	}
 
-	// gliderlabs/ssh returns a command slice of zero
-	// when a shell is requested.
-	command := rawCommand
-	if len(command) == 0 {
-		command = shell
-		if runtime.GOOS != "windows" {
-			// On Linux and macOS, we should start a login
-			// shell to consume juicy environment variables!
-			command += " -l"
-		}
-	}
-
 	// OpenSSH executes all commands with the users current shell.
 	// We replicate that behavior for IDE support.
 	caller := "-c"
 	if runtime.GOOS == "windows" {
 		caller = "/c"
 	}
-	cmd := exec.CommandContext(ctx, shell, caller, command)
+	args := []string{caller, rawCommand}
+
+	// gliderlabs/ssh returns a command slice of zero
+	// when a shell is requested.
+	if len(rawCommand) == 0 {
+		args = []string{}
+		if runtime.GOOS != "windows" {
+			// On Linux and macOS, we should start a login
+			// shell to consume juicy environment variables!
+			args = append(args, "-l")
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, shell, args...)
 	cmd.Dir = metadata.Directory
 	if cmd.Dir == "" {
-		// Default to $HOME if a directory is not set!
-		cmd.Dir = os.Getenv("HOME")
+		// Default to user home if a directory is not set.
+		homedir, err := userHomeDir()
+		if err != nil {
+			return nil, xerrors.Errorf("get home dir: %w", err)
+		}
+		cmd.Dir = homedir
 	}
 	cmd.Env = append(os.Environ(), env...)
 	executablePath, err := os.Executable()
@@ -536,12 +657,14 @@ func (a *agent) createCommand(ctx context.Context, rawCommand string, env []stri
 	// Set environment variables reliable detection of being inside a
 	// Coder workspace.
 	cmd.Env = append(cmd.Env, "CODER=true")
-
 	cmd.Env = append(cmd.Env, fmt.Sprintf("USER=%s", username))
 	// Git on Windows resolves with UNIX-style paths.
 	// If using backslashes, it's unable to find the executable.
 	unixExecutablePath := strings.ReplaceAll(executablePath, "\\", "/")
 	cmd.Env = append(cmd.Env, fmt.Sprintf(`GIT_SSH_COMMAND=%s gitssh --`, unixExecutablePath))
+
+	// Specific Coder subcommands require the agent token exposed!
+	cmd.Env = append(cmd.Env, fmt.Sprintf("CODER_AGENT_TOKEN=%s", *a.sessionToken.Load()))
 
 	// Set SSH connection environment variables (these are also set by OpenSSH
 	// and thus expected to be present by SSH clients). Since the agent does
@@ -551,6 +674,13 @@ func (a *agent) createCommand(ctx context.Context, rawCommand string, env []stri
 	dstAddr, dstPort := "0.0.0.0", "0"
 	cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_CLIENT=%s %s %s", srcAddr, srcPort, dstPort))
 	cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_CONNECTION=%s %s %s %s", srcAddr, srcPort, dstAddr, dstPort))
+
+	// This adds the ports dialog to code-server that enables
+	// proxying a port dynamically.
+	cmd.Env = append(cmd.Env, fmt.Sprintf("VSCODE_PROXY_URI=%s", metadata.VSCodePortProxyURI))
+
+	// Hide Coder message on code-server's "Getting Started" page
+	cmd.Env = append(cmd.Env, "CS_DISABLE_GETTING_STARTED_OVERRIDE=true")
 
 	// Load environment variables passed via the agent.
 	// These should override all variables we manually specify.
@@ -592,6 +722,18 @@ func (a *agent) handleSSHSession(session ssh.Session) (retErr error) {
 		// Disable minimal PTY emulation set by gliderlabs/ssh (NL-to-CRNL).
 		// See https://github.com/coder/coder/issues/3371.
 		session.DisablePTYEmulation()
+
+		if !isQuietLogin(session.RawCommand()) {
+			metadata, ok := a.metadata.Load().(codersdk.WorkspaceAgentMetadata)
+			if ok {
+				err = showMOTD(session, metadata.MOTDFile)
+				if err != nil {
+					a.logger.Error(ctx, "show MOTD", slog.Error(err))
+				}
+			} else {
+				a.logger.Warn(ctx, "metadata lookup failed, unable to show MOTD")
+			}
+		}
 
 		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", sshPty.Term))
 
@@ -658,6 +800,7 @@ func (a *agent) handleSSHSession(session ssh.Session) (retErr error) {
 func (a *agent) handleReconnectingPTY(ctx context.Context, msg codersdk.ReconnectingPTYInit, conn net.Conn) {
 	defer conn.Close()
 
+	connectionID := uuid.NewString()
 	var rpty *reconnectingPTY
 	rawRPTY, ok := a.reconnectingPTYs.Load(msg.ID)
 	if ok {
@@ -684,17 +827,18 @@ func (a *agent) handleReconnectingPTY(ctx context.Context, msg codersdk.Reconnec
 
 		ptty, process, err := pty.Start(cmd)
 		if err != nil {
-			a.logger.Error(ctx, "start reconnecting pty command", slog.F("id", msg.ID))
+			a.logger.Error(ctx, "start reconnecting pty command", slog.F("id", msg.ID), slog.Error(err))
 			return
 		}
 
-		a.closeMutex.Lock()
-		a.connCloseWait.Add(1)
-		a.closeMutex.Unlock()
 		ctx, cancelFunc := context.WithCancel(ctx)
 		rpty = &reconnectingPTY{
-			activeConns: make(map[string]net.Conn),
-			ptty:        ptty,
+			activeConns: map[string]net.Conn{
+				// We have to put the connection in the map instantly otherwise
+				// the connection won't be closed if the process instantly dies.
+				connectionID: conn,
+			},
+			ptty: ptty,
 			// Timeouts created with an after func can be reset!
 			timeout:        time.AfterFunc(a.reconnectingPTYTimeout, cancelFunc),
 			circularBuffer: circularBuffer,
@@ -715,7 +859,7 @@ func (a *agent) handleReconnectingPTY(ctx context.Context, msg codersdk.Reconnec
 			_ = process.Wait()
 			rpty.Close()
 		}()
-		go func() {
+		if err = a.trackConnGoroutine(func() {
 			buffer := make([]byte, 1024)
 			for {
 				read, err := rpty.ptty.Output().Read(buffer)
@@ -743,8 +887,10 @@ func (a *agent) handleReconnectingPTY(ctx context.Context, msg codersdk.Reconnec
 			_ = process.Kill()
 			rpty.Close()
 			a.reconnectingPTYs.Delete(msg.ID)
-			a.connCloseWait.Done()
-		}()
+		}); err != nil {
+			a.logger.Error(ctx, "start reconnecting pty routine", slog.F("id", msg.ID), slog.Error(err))
+			return
+		}
 	}
 	// Resize the PTY to initial height + width.
 	err := rpty.ptty.Resize(msg.Height, msg.Width)
@@ -760,7 +906,6 @@ func (a *agent) handleReconnectingPTY(ctx context.Context, msg codersdk.Reconnec
 		a.logger.Warn(ctx, "write reconnecting pty buffer", slog.F("id", msg.ID), slog.Error(err))
 		return
 	}
-	connectionID := uuid.NewString()
 	// Multiple connections to the same TTY are permitted.
 	// This could easily be used for terminal sharing, but
 	// we do it because it's a nice user experience to
@@ -878,12 +1023,22 @@ func (r *reconnectingPTY) Close() {
 // after one or both of them are done writing. If the context is canceled, both
 // of the connections will be closed.
 func Bicopy(ctx context.Context, c1, c2 io.ReadWriteCloser) {
-	defer c1.Close()
-	defer c2.Close()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	defer func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}()
 
 	var wg sync.WaitGroup
 	copyFunc := func(dst io.WriteCloser, src io.Reader) {
-		defer wg.Done()
+		defer func() {
+			wg.Done()
+			// If one side of the copy fails, ensure the other one exits as
+			// well.
+			cancel()
+		}()
 		_, _ = io.Copy(dst, src)
 	}
 
@@ -904,19 +1059,74 @@ func Bicopy(ctx context.Context, c1, c2 io.ReadWriteCloser) {
 	}
 }
 
-// ExpandRelativeHomePath expands the tilde at the beginning of a path to the
-// current user's home directory and returns a full absolute path.
-func ExpandRelativeHomePath(in string) (string, error) {
-	usr, err := user.Current()
+// isQuietLogin checks if the SSH server should perform a quiet login or not.
+//
+// https://github.com/openssh/openssh-portable/blob/25bd659cc72268f2858c5415740c442ee950049f/session.c#L816
+func isQuietLogin(rawCommand string) bool {
+	// We are always quiet unless this is a login shell.
+	if len(rawCommand) != 0 {
+		return true
+	}
+
+	// Best effort, if we can't get the home directory,
+	// we can't lookup .hushlogin.
+	homedir, err := userHomeDir()
 	if err != nil {
-		return "", xerrors.Errorf("get current user details: %w", err)
+		return false
 	}
 
-	if in == "~" {
-		in = usr.HomeDir
-	} else if strings.HasPrefix(in, "~/") {
-		in = filepath.Join(usr.HomeDir, in[2:])
+	_, err = os.Stat(filepath.Join(homedir, ".hushlogin"))
+	return err == nil
+}
+
+// showMOTD will output the message of the day from
+// the given filename to dest, if the file exists.
+//
+// https://github.com/openssh/openssh-portable/blob/25bd659cc72268f2858c5415740c442ee950049f/session.c#L784
+func showMOTD(dest io.Writer, filename string) error {
+	if filename == "" {
+		return nil
 	}
 
-	return filepath.Abs(in)
+	f, err := os.Open(filename)
+	if err != nil {
+		if xerrors.Is(err, os.ErrNotExist) {
+			// This is not an error, there simply isn't a MOTD to show.
+			return nil
+		}
+		return xerrors.Errorf("open MOTD: %w", err)
+	}
+	defer f.Close()
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		// Carriage return ensures each line starts
+		// at the beginning of the terminal.
+		_, err = fmt.Fprint(dest, s.Text()+"\r\n")
+		if err != nil {
+			return xerrors.Errorf("write MOTD: %w", err)
+		}
+	}
+	if err := s.Err(); err != nil {
+		return xerrors.Errorf("read MOTD: %w", err)
+	}
+
+	return nil
+}
+
+// userHomeDir returns the home directory of the current user, giving
+// priority to the $HOME environment variable.
+func userHomeDir() (string, error) {
+	// First we check the environment.
+	homedir, err := os.UserHomeDir()
+	if err == nil {
+		return homedir, nil
+	}
+
+	// As a fallback, we try the user information.
+	u, err := user.Current()
+	if err != nil {
+		return "", xerrors.Errorf("current user: %w", err)
+	}
+	return u.HomeDir, nil
 }

@@ -35,7 +35,7 @@ func templatePull() *cobra.Command {
 			}
 
 			// TODO(JonA): Do we need to add a flag for organization?
-			organization, err := currentOrganization(cmd, client)
+			organization, err := CurrentOrganization(cmd, client)
 			if err != nil {
 				return xerrors.Errorf("current organization: %w", err)
 			}
@@ -66,7 +66,7 @@ func templatePull() *cobra.Command {
 			latest := versions[0]
 
 			// Download the tar archive.
-			raw, ctype, err := client.Download(ctx, latest.Job.StorageSource)
+			raw, ctype, err := client.Download(ctx, latest.Job.FileID)
 			if err != nil {
 				return xerrors.Errorf("download template: %w", err)
 			}

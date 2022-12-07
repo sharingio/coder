@@ -13,11 +13,14 @@ import (
 	"github.com/moby/moby/pkg/namesgenerator"
 	"golang.org/x/xerrors"
 
+	"cdr.dev/slog"
+
 	"github.com/coder/coder/coderd/audit"
 	"github.com/coder/coder/coderd/database"
 	"github.com/coder/coder/coderd/httpapi"
 	"github.com/coder/coder/coderd/httpmw"
 	"github.com/coder/coder/coderd/parameter"
+	"github.com/coder/coder/coderd/provisionerdserver"
 	"github.com/coder/coder/coderd/rbac"
 	"github.com/coder/coder/codersdk"
 )
@@ -43,16 +46,16 @@ func (api *API) templateVersion(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	createdByName, err := getUsernameByUserID(ctx, api.Database, templateVersion.CreatedBy)
+	user, err := api.Database.GetUserByID(ctx, templateVersion.CreatedBy)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching creator name.",
+			Message: "Internal error on fetching user.",
 			Detail:  err.Error(),
 		})
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(job), createdByName))
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(job), user))
 }
 
 func (api *API) patchCancelTemplateVersion(rw http.ResponseWriter, r *http.Request) {
@@ -262,7 +265,7 @@ func (api *API) postTemplateVersionDryRun(rw http.ResponseWriter, r *http.Reques
 
 	// Marshal template version dry-run job with the parameters from the
 	// request.
-	input, err := json.Marshal(templateVersionDryRunJob{
+	input, err := json.Marshal(provisionerdserver.TemplateVersionDryRunJob{
 		TemplateVersionID: templateVersion.ID,
 		WorkspaceName:     req.WorkspaceName,
 		ParameterValues:   parameterValues,
@@ -285,9 +288,11 @@ func (api *API) postTemplateVersionDryRun(rw http.ResponseWriter, r *http.Reques
 		InitiatorID:    apiKey.UserID,
 		Provisioner:    job.Provisioner,
 		StorageMethod:  job.StorageMethod,
-		StorageSource:  job.StorageSource,
+		FileID:         job.FileID,
 		Type:           database.ProvisionerJobTypeTemplateVersionDryRun,
 		Input:          input,
+		// Copy tags from the previous run.
+		Tags: job.Tags,
 	})
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
@@ -420,7 +425,8 @@ func (api *API) fetchTemplateVersionDryRunJob(rw http.ResponseWriter, r *http.Re
 		httpapi.Forbidden(rw)
 		return database.ProvisionerJob{}, false
 	}
-	// Do a workspace resource check since it's basically a workspace dry-run .
+
+	// Do a workspace resource check since it's basically a workspace dry-run.
 	if !api.Authorize(r, rbac.ActionRead,
 		rbac.ResourceWorkspace.InOrg(templateVersion.OrganizationID).WithOwner(job.InitiatorID.String())) {
 		httpapi.Forbidden(rw)
@@ -428,11 +434,11 @@ func (api *API) fetchTemplateVersionDryRunJob(rw http.ResponseWriter, r *http.Re
 	}
 
 	// Verify that the template version is the one used in the request.
-	var input templateVersionDryRunJob
+	var input provisionerdserver.TemplateVersionDryRunJob
 	err = json.Unmarshal(job.Input, &input)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error unmarshaling job metadata.",
+			Message: "Internal error unmarshalling job metadata.",
 			Detail:  err.Error(),
 		})
 		return database.ProvisionerJob{}, false
@@ -522,19 +528,19 @@ func (api *API) templateVersionsByTemplate(rw http.ResponseWriter, r *http.Reque
 				})
 				return err
 			}
-			createdByName, err := getUsernameByUserID(ctx, store, version.CreatedBy)
+			user, err := store.GetUserByID(ctx, version.CreatedBy)
 			if err != nil {
 				httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-					Message: "Internal error fetching creator name.",
+					Message: "Internal error on fetching user.",
 					Detail:  err.Error(),
 				})
 				return err
 			}
-			apiVersions = append(apiVersions, convertTemplateVersion(version, convertProvisionerJob(job), createdByName))
+			apiVersions = append(apiVersions, convertTemplateVersion(version, convertProvisionerJob(job), user))
 		}
 
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		return
 	}
@@ -580,16 +586,123 @@ func (api *API) templateVersionByName(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	createdByName, err := getUsernameByUserID(ctx, api.Database, templateVersion.CreatedBy)
+	user, err := api.Database.GetUserByID(ctx, templateVersion.CreatedBy)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching creator name.",
+			Message: "Internal error on fetching user.",
 			Detail:  err.Error(),
 		})
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(job), createdByName))
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(job), user))
+}
+
+func (api *API) templateVersionByOrganizationAndName(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	organization := httpmw.OrganizationParam(r)
+	templateVersionName := chi.URLParam(r, "templateversionname")
+	templateVersion, err := api.Database.GetTemplateVersionByOrganizationAndName(ctx, database.GetTemplateVersionByOrganizationAndNameParams{
+		OrganizationID: organization.ID,
+		Name:           templateVersionName,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		httpapi.Write(ctx, rw, http.StatusNotFound, codersdk.Response{
+			Message: fmt.Sprintf("No template version found by name %q.", templateVersionName),
+		})
+		return
+	}
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error fetching template version.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+	job, err := api.Database.GetProvisionerJobByID(ctx, templateVersion.JobID)
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error fetching provisioner job.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	user, err := api.Database.GetUserByID(ctx, templateVersion.CreatedBy)
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error on fetching user.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(job), user))
+}
+
+func (api *API) previousTemplateVersionByOrganizationAndName(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	organization := httpmw.OrganizationParam(r)
+	templateVersionName := chi.URLParam(r, "templateversionname")
+	templateVersion, err := api.Database.GetTemplateVersionByOrganizationAndName(ctx, database.GetTemplateVersionByOrganizationAndNameParams{
+		OrganizationID: organization.ID,
+		Name:           templateVersionName,
+	})
+	if err != nil {
+		if xerrors.Is(err, sql.ErrNoRows) {
+			httpapi.Write(ctx, rw, http.StatusNotFound, codersdk.Response{
+				Message: fmt.Sprintf("No template version found by name %q.", templateVersionName),
+			})
+			return
+		}
+
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error fetching template version.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	previousTemplateVersion, err := api.Database.GetPreviousTemplateVersion(ctx, database.GetPreviousTemplateVersionParams{
+		OrganizationID: organization.ID,
+		Name:           templateVersionName,
+		TemplateID:     templateVersion.TemplateID,
+	})
+
+	if err != nil {
+		if xerrors.Is(err, sql.ErrNoRows) {
+			httpapi.Write(ctx, rw, http.StatusNotFound, codersdk.Response{
+				Message: fmt.Sprintf("No previous template version found for %q.", templateVersionName),
+			})
+			return
+		}
+
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error fetching the previous template version.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	job, err := api.Database.GetProvisionerJobByID(ctx, previousTemplateVersion.JobID)
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error fetching provisioner job.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	user, err := api.Database.GetUserByID(ctx, templateVersion.CreatedBy)
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error on fetching user.",
+			Detail:  err.Error(),
+		})
+		return
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(previousTemplateVersion, convertProvisionerJob(job), user))
 }
 
 func (api *API) patchActiveTemplateVersion(rw http.ResponseWriter, r *http.Request) {
@@ -647,7 +760,7 @@ func (api *API) patchActiveTemplateVersion(rw http.ResponseWriter, r *http.Reque
 			return xerrors.Errorf("update active version: %w", err)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
 			Message: "Internal error updating active template version.",
@@ -658,6 +771,8 @@ func (api *API) patchActiveTemplateVersion(rw http.ResponseWriter, r *http.Reque
 	newTemplate := template
 	newTemplate.ActiveVersionID = req.ID
 	aReq.New = newTemplate
+
+	api.publishTemplateUpdate(ctx, template.ID)
 
 	httpapi.Write(ctx, rw, http.StatusOK, codersdk.Response{
 		Message: "Updated the active template version!",
@@ -716,7 +831,10 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 		return
 	}
 
-	file, err := api.Database.GetFileByHash(ctx, req.StorageSource)
+	// Ensures the "owner" is properly applied.
+	tags := provisionerdserver.MutateTags(apiKey.UserID, req.ProvisionerTags)
+
+	file, err := api.Database.GetFileByID(ctx, req.FileID)
 	if errors.Is(err, sql.ErrNoRows) {
 		httpapi.Write(ctx, rw, http.StatusNotFound, codersdk.Response{
 			Message: "File not found.",
@@ -731,12 +849,10 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 		return
 	}
 
-	// TODO(JonA): Readd this check once we update the unique constraint
-	// on files to be owner + hash.
-	// if !api.Authorize(r, rbac.ActionRead, file) {
-	// 	httpapi.ResourceNotFound(rw)
-	// 	return
-	// }
+	if !api.Authorize(r, rbac.ActionRead, file) {
+		httpapi.ResourceNotFound(rw)
+		return
+	}
 
 	var templateVersion database.TemplateVersion
 	var provisionerJob database.ProvisionerJob
@@ -813,9 +929,10 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 			InitiatorID:    apiKey.UserID,
 			Provisioner:    database.ProvisionerType(req.Provisioner),
 			StorageMethod:  database.ProvisionerStorageMethodFile,
-			StorageSource:  file.Hash,
+			FileID:         file.ID,
 			Type:           database.ProvisionerJobTypeTemplateVersionImport,
 			Input:          []byte{'{', '}'},
+			Tags:           tags,
 		})
 		if err != nil {
 			return xerrors.Errorf("insert provisioner job: %w", err)
@@ -842,16 +959,13 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 			Name:           req.Name,
 			Readme:         "",
 			JobID:          provisionerJob.ID,
-			CreatedBy: uuid.NullUUID{
-				UUID:  apiKey.UserID,
-				Valid: true,
-			},
+			CreatedBy:      apiKey.UserID,
 		})
 		if err != nil {
 			return xerrors.Errorf("insert template version: %w", err)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
 			Message: err.Error(),
@@ -860,16 +974,16 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 	}
 	aReq.New = templateVersion
 
-	createdByName, err := getUsernameByUserID(ctx, api.Database, templateVersion.CreatedBy)
+	user, err := api.Database.GetUserByID(ctx, templateVersion.CreatedBy)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching creator name.",
+			Message: "Internal error on fetching user.",
 			Detail:  err.Error(),
 		})
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusCreated, convertTemplateVersion(templateVersion, convertProvisionerJob(provisionerJob), createdByName))
+	httpapi.Write(ctx, rw, http.StatusCreated, convertTemplateVersion(templateVersion, convertProvisionerJob(provisionerJob), user))
 }
 
 // templateVersionResources returns the workspace agent resources associated
@@ -927,18 +1041,17 @@ func (api *API) templateVersionLogs(rw http.ResponseWriter, r *http.Request) {
 	api.provisionerJobLogs(rw, r, job)
 }
 
-func getUsernameByUserID(ctx context.Context, db database.Store, userID uuid.NullUUID) (string, error) {
-	if !userID.Valid {
-		return "", nil
+func convertTemplateVersion(version database.TemplateVersion, job codersdk.ProvisionerJob, user database.User) codersdk.TemplateVersion {
+	createdBy := codersdk.User{
+		ID:        user.ID,
+		Username:  user.Username,
+		Email:     user.Email,
+		CreatedAt: user.CreatedAt,
+		Status:    codersdk.UserStatus(user.Status),
+		Roles:     []codersdk.Role{},
+		AvatarURL: user.AvatarURL.String,
 	}
-	user, err := db.GetUserByID(ctx, userID.UUID)
-	if err != nil {
-		return "", err
-	}
-	return user.Username, nil
-}
 
-func convertTemplateVersion(version database.TemplateVersion, job codersdk.ProvisionerJob, createdByName string) codersdk.TemplateVersion {
 	return codersdk.TemplateVersion{
 		ID:             version.ID,
 		TemplateID:     &version.TemplateID.UUID,
@@ -948,7 +1061,18 @@ func convertTemplateVersion(version database.TemplateVersion, job codersdk.Provi
 		Name:           version.Name,
 		Job:            job,
 		Readme:         version.Readme,
-		CreatedByID:    version.CreatedBy.UUID,
-		CreatedByName:  createdByName,
+		CreatedBy:      createdBy,
+	}
+}
+
+func watchTemplateChannel(id uuid.UUID) string {
+	return fmt.Sprintf("template:%s", id)
+}
+
+func (api *API) publishTemplateUpdate(ctx context.Context, templateID uuid.UUID) {
+	err := api.Pubsub.Publish(watchTemplateChannel(templateID), []byte{})
+	if err != nil {
+		api.Logger.Warn(ctx, "failed to publish template update",
+			slog.F("template_id", templateID), slog.Error(err))
 	}
 }

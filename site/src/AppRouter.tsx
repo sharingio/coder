@@ -21,6 +21,7 @@ import { XServiceContext } from "xServices/StateContext"
 import { AuthAndFrame } from "./components/AuthAndFrame/AuthAndFrame"
 import { RequireAuth } from "./components/RequireAuth/RequireAuth"
 import { SettingsLayout } from "./components/SettingsLayout/SettingsLayout"
+import { DeploySettingsLayout } from "components/DeploySettingsLayout/DeploySettingsLayout"
 
 // Lazy load pages
 // - Pages that are secondary, not in the main navigation or not usually accessed
@@ -29,7 +30,6 @@ const NotFoundPage = lazy(() => import("./pages/404Page/404Page"))
 const CliAuthenticationPage = lazy(
   () => import("./pages/CliAuthPage/CliAuthPage"),
 )
-const HealthzPage = lazy(() => import("./pages/HealthzPage/HealthzPage"))
 const AccountPage = lazy(
   () => import("./pages/UserSettingsPage/AccountPage/AccountPage"),
 )
@@ -46,6 +46,9 @@ const WorkspaceBuildPage = lazy(
   () => import("./pages/WorkspaceBuildPage/WorkspaceBuildPage"),
 )
 const WorkspacePage = lazy(() => import("./pages/WorkspacePage/WorkspacePage"))
+const WorkspaceChangeVersionPage = lazy(
+  () => import("./pages/WorkspaceChangeVersionPage/WorkspaceChangeVersionPage"),
+)
 const WorkspaceSchedulePage = lazy(
   () => import("./pages/WorkspaceSchedulePage/WorkspaceSchedulePage"),
 )
@@ -66,6 +69,28 @@ const CreateGroupPage = lazy(() => import("./pages/GroupsPage/CreateGroupPage"))
 const GroupPage = lazy(() => import("./pages/GroupsPage/GroupPage"))
 const SettingsGroupPage = lazy(
   () => import("./pages/GroupsPage/SettingsGroupPage"),
+)
+const GeneralSettingsPage = lazy(
+  () => import("./pages/DeploySettingsPage/GeneralSettingsPage"),
+)
+const SecuritySettingsPage = lazy(
+  () => import("./pages/DeploySettingsPage/SecuritySettingsPage"),
+)
+const ServiceBannerSettingsPage = lazy(
+  () => import("./pages/DeploySettingsPage/ServiceBannerSettingsPage"),
+)
+const UserAuthSettingsPage = lazy(
+  () => import("./pages/DeploySettingsPage/UserAuthSettingsPage"),
+)
+const GitAuthSettingsPage = lazy(
+  () => import("./pages/DeploySettingsPage/GitAuthSettingsPage"),
+)
+const NetworkSettingsPage = lazy(
+  () => import("./pages/DeploySettingsPage/NetworkSettingsPage"),
+)
+const GitAuthPage = lazy(() => import("./pages/GitAuthPage/GitAuthPage"))
+const TemplateVersionPage = lazy(
+  () => import("./pages/TemplateVersionPage/TemplateVersionPage"),
 )
 
 export const AppRouter: FC = () => {
@@ -90,7 +115,6 @@ export const AppRouter: FC = () => {
 
         <Route path="login" element={<LoginPage />} />
         <Route path="setup" element={<SetupPage />} />
-        <Route path="healthz" element={<HealthzPage />} />
         <Route
           path="cli-auth"
           element={
@@ -99,17 +123,23 @@ export const AppRouter: FC = () => {
             </RequireAuth>
           }
         />
+        <Route
+          path="gitauth"
+          element={
+            <RequireAuth>
+              <GitAuthPage />
+            </RequireAuth>
+          }
+        />
 
-        <Route path="workspaces">
-          <Route
-            index
-            element={
-              <AuthAndFrame>
-                <WorkspacesPage />
-              </AuthAndFrame>
-            }
-          />
-        </Route>
+        <Route
+          path="workspaces"
+          element={
+            <AuthAndFrame>
+              <WorkspacesPage />
+            </AuthAndFrame>
+          }
+        />
 
         <Route path="templates">
           <Route
@@ -158,6 +188,16 @@ export const AppRouter: FC = () => {
                 </RequireAuth>
               }
             />
+            <Route path="versions">
+              <Route
+                path=":version"
+                element={
+                  <AuthAndFrame>
+                    <TemplateVersionPage />
+                  </AuthAndFrame>
+                }
+              />
+            </Route>
           </Route>
         </Route>
 
@@ -237,6 +277,93 @@ export const AppRouter: FC = () => {
           />
         </Route>
 
+        <Route path="/settings/deployment">
+          <Route
+            path="general"
+            element={
+              <AuthAndFrame>
+                <RequirePermission
+                  isFeatureVisible={Boolean(permissions?.viewDeploymentConfig)}
+                >
+                  <DeploySettingsLayout>
+                    <GeneralSettingsPage />
+                  </DeploySettingsLayout>
+                </RequirePermission>
+              </AuthAndFrame>
+            }
+          />
+          <Route
+            path="security"
+            element={
+              <AuthAndFrame>
+                <RequirePermission
+                  isFeatureVisible={Boolean(permissions?.viewDeploymentConfig)}
+                >
+                  <DeploySettingsLayout>
+                    <SecuritySettingsPage />
+                  </DeploySettingsLayout>
+                </RequirePermission>
+              </AuthAndFrame>
+            }
+          />
+          <Route
+            path="service-banner"
+            element={
+              <AuthAndFrame>
+                <RequirePermission
+                  isFeatureVisible={Boolean(permissions?.viewDeploymentConfig)}
+                >
+                  <DeploySettingsLayout>
+                    <ServiceBannerSettingsPage />
+                  </DeploySettingsLayout>
+                </RequirePermission>
+              </AuthAndFrame>
+            }
+          />
+          <Route
+            path="network"
+            element={
+              <AuthAndFrame>
+                <RequirePermission
+                  isFeatureVisible={Boolean(permissions?.viewDeploymentConfig)}
+                >
+                  <DeploySettingsLayout>
+                    <NetworkSettingsPage />
+                  </DeploySettingsLayout>
+                </RequirePermission>
+              </AuthAndFrame>
+            }
+          />
+          <Route
+            path="userauth"
+            element={
+              <AuthAndFrame>
+                <RequirePermission
+                  isFeatureVisible={Boolean(permissions?.viewDeploymentConfig)}
+                >
+                  <DeploySettingsLayout>
+                    <UserAuthSettingsPage />
+                  </DeploySettingsLayout>
+                </RequirePermission>
+              </AuthAndFrame>
+            }
+          />
+          <Route
+            path="gitauth"
+            element={
+              <AuthAndFrame>
+                <RequirePermission
+                  isFeatureVisible={Boolean(permissions?.viewDeploymentConfig)}
+                >
+                  <DeploySettingsLayout>
+                    <GitAuthSettingsPage />
+                  </DeploySettingsLayout>
+                </RequirePermission>
+              </AuthAndFrame>
+            }
+          />
+        </Route>
+
         <Route path="settings" element={<SettingsLayout />}>
           <Route path="account" element={<AccountPage />} />
           <Route path="security" element={<SecurityPage />} />
@@ -253,6 +380,7 @@ export const AppRouter: FC = () => {
                 </AuthAndFrame>
               }
             />
+
             <Route
               path="schedule"
               element={
@@ -277,6 +405,15 @@ export const AppRouter: FC = () => {
                 <AuthAndFrame>
                   <WorkspaceBuildPage />
                 </AuthAndFrame>
+              }
+            />
+
+            <Route
+              path="change-version"
+              element={
+                <RequireAuth>
+                  <WorkspaceChangeVersionPage />
+                </RequireAuth>
               }
             />
           </Route>

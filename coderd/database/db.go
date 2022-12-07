@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"golang.org/x/xerrors"
@@ -24,7 +25,8 @@ type Store interface {
 	// customQuerier contains custom queries that are not generated.
 	customQuerier
 
-	InTx(func(Store) error) error
+	Ping(ctx context.Context) (time.Duration, error)
+	InTx(func(Store) error, *sql.TxOptions) error
 }
 
 // DBTX represents a database connection or transaction.
@@ -58,8 +60,15 @@ type sqlQuerier struct {
 	db  DBTX
 }
 
+// Ping returns the time it takes to ping the database.
+func (q *sqlQuerier) Ping(ctx context.Context) (time.Duration, error) {
+	start := time.Now()
+	err := q.sdb.PingContext(ctx)
+	return time.Since(start), err
+}
+
 // InTx performs database operations inside a transaction.
-func (q *sqlQuerier) InTx(function func(Store) error) error {
+func (q *sqlQuerier) InTx(function func(Store) error, txOpts *sql.TxOptions) error {
 	if _, ok := q.db.(*sqlx.Tx); ok {
 		// If the current inner "db" is already a transaction, we just reuse it.
 		// We do not need to handle commit/rollback as the outer tx will handle
@@ -71,7 +80,7 @@ func (q *sqlQuerier) InTx(function func(Store) error) error {
 		return nil
 	}
 
-	transaction, err := q.sdb.BeginTxx(context.Background(), nil)
+	transaction, err := q.sdb.BeginTxx(context.Background(), txOpts)
 	if err != nil {
 		return xerrors.Errorf("begin transaction: %w", err)
 	}
