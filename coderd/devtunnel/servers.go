@@ -32,14 +32,14 @@ type Node struct {
 var Regions = []Region{
 	{
 		ID:           0,
-		LocationName: "US East Pittsburgh",
+		LocationName: "iimaginarium fop.nz Tauranga, Bay of Plenty NEW ZEALAND!",
 		Nodes: []Node{
 			{
 				ID:                1,
 				RegionID:          0,
-				HostnameHTTPS:     "pit-1.try.coder.app",
-				HostnameWireguard: "pit-1.try.coder.app",
-				WireguardPort:     55551,
+				HostnameHTTPS:     "try.ii.nz",
+				HostnameWireguard: "try.ii.nz",
+				WireguardPort:     54321,
 			},
 		},
 	},
